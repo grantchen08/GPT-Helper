@@ -197,7 +197,7 @@ class MainWindow(QtWidgets.QMainWindow):
             match_line_num = self._find_best_match(target_lines, context_lines)
             
             if match_line_num is not None:
-                self._align_views(self.patch_edit, first_context_block, self.file_viewer, match_line_num)
+                self._scroll_target_line_to_top(self.file_viewer, match_line_num)
 
     def _find_best_match(self, target_lines: list, query_lines: list, min_score=75) -> int | None:
         """Finds the best fuzzy match for a block of lines."""
@@ -226,38 +226,29 @@ class MainWindow(QtWidgets.QMainWindow):
 
         return best_line_num if best_score >= min_score else None
 
-    def _align_views(self, source_editor, source_block, target_editor, target_line_num):
-        """Scrolls the target editor to align with the source block."""
-        # 1. Get the desired Y position from the source editor's viewport.
-        source_cursor = source_editor.textCursor()
-        source_cursor.setPosition(source_block.position())
-        desired_viewport_y = source_editor.cursorRect(source_cursor).top()
-
-        # 2. Find the target block in the target editor.
+    def _scroll_target_line_to_top(self, target_editor: QtWidgets.QPlainTextEdit, target_line_num: int):
+        """Scrolls the target editor so that target_line_num is at the top of the viewport."""
         target_block = target_editor.document().findBlockByNumber(target_line_num - 1)
         if not target_block.isValid():
             if self._debug:
                 print("[ALIGN] FAILED: Target line number is invalid.")
             return
 
-        # 3. Get the absolute Y position of the target block within the entire document.
-        # THIS IS THE CORRECTED LOGIC. We simply get the block's geometry top.
-        absolute_target_y = target_editor.blockBoundingGeometry(target_block).top()
+        cur = target_editor.textCursor()
+        cur.setPosition(target_block.position())
+        target_editor.setTextCursor(cur)
 
-        # 4. Calculate the new scrollbar value.
-        # New Value = (Absolute position of the line) - (Desired position on screen)
-        new_scroll_val = absolute_target_y - desired_viewport_y
+        # Make sure it's visible first
+        target_editor.ensureCursorVisible()
 
-        # 5. Set the scrollbar value.
-        scrollbar = target_editor.verticalScrollBar()
-        initial_scroll_val = scrollbar.value()
-        
+        # Then nudge so it sits at the very top of the viewport (no fine adjustment)
+        rect = target_editor.cursorRect(cur)  # viewport coordinates
+        sb = target_editor.verticalScrollBar()
+        before = sb.value()
+        sb.setValue(before + rect.top())
+
         if self._debug:
-            print("[ALIGN] Desired Viewport Y (from source):", desired_viewport_y)
-            print("[ALIGN] Absolute Target Y (in document):", absolute_target_y)
-            print(f"[ALIGN] Scrollbar: {initial_scroll_val} -> {int(new_scroll_val)}")
-
-        scrollbar.setValue(int(new_scroll_val))
+            print(f"[ALIGN] Top-align: cursor_top={rect.top()} scrollbar: {before} -> {sb.value()}")
 
     def choose_root(self):
         current = self.root_edit.text() or os.getcwd()
