@@ -56,7 +56,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         splitter.addWidget(self.patch_edit)
         splitter.addWidget(self.file_viewer_edit)
-        splitter.setSizes([600, 600]) # Initial equal sizing
+        splitter.setSizes([600, 600])
 
         # Status bar
         self.statusBar().showMessage("Ready")
@@ -64,12 +64,11 @@ class MainWindow(QtWidgets.QMainWindow):
         # Load persisted settings
         self.load_settings()
 
-    @QtCore.Slot(int, str)
-    def _on_chunk_hovered(self, chunk_idx: int, file_path: str):
-        """Loads file content into the right pane when a chunk is hovered."""
+    @QtCore.Slot(int, str, int)
+    def _on_chunk_hovered(self, chunk_idx: int, file_path: str, start_line: int):
+        """Loads file content and scrolls to the correct line."""
         if chunk_idx == -1 or not file_path:
-            if self.file_viewer_edit.toPlainText():
-                self.file_viewer_edit.clear()
+            # Don't clear the viewer, just stop updating
             return
 
         root_dir = self.root_edit.text()
@@ -79,23 +78,46 @@ class MainWindow(QtWidgets.QMainWindow):
 
         full_path = os.path.join(root_dir, file_path)
 
-        try:
-            if os.path.isfile(full_path):
-                with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
-                    content = f.read()
-                self.file_viewer_edit.setPlainText(content)
-                self.statusBar().showMessage(f"Showing: {file_path}", 4000)
-            else:
-                self.file_viewer_edit.setPlainText(
-                    f"File not found at the specified path.\n\n"
-                    f"Root: {root_dir}\n"
-                    f"File: {file_path}\n"
-                    f"Full Path: {full_path}"
-                )
-                self.statusBar().showMessage(f"File not found: {file_path}", 4000)
-        except Exception as e:
-            self.file_viewer_edit.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
-            self.statusBar().showMessage(f"Error reading {file_path}", 4000)
+        # Avoid reloading if the file is already displayed
+        current_path = self.file_viewer_edit.property("current_file")
+        if current_path != full_path:
+            try:
+                if os.path.isfile(full_path):
+                    with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                        content = f.read()
+                    self.file_viewer_edit.setPlainText(content)
+                    self.file_viewer_edit.setProperty("current_file", full_path)
+                    self.statusBar().showMessage(f"Showing: {file_path}", 4000)
+                else:
+                    self.file_viewer_edit.setPlainText(
+                        f"File not found at the specified path.\n\n"
+                        f"Root: {root_dir}\n"
+                        f"File: {file_path}\n"
+                        f"Full Path: {full_path}"
+                    )
+                    self.file_viewer_edit.setProperty("current_file", None)
+                    self.statusBar().showMessage(f"File not found: {file_path}", 4000)
+            except Exception as e:
+                self.file_viewer_edit.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
+                self.file_viewer_edit.setProperty("current_file", None)
+                self.statusBar().showMessage(f"Error reading {file_path}", 4000)
+        
+        # Now, scroll to the line
+        if start_line > 0:
+            self._scroll_to_line(self.file_viewer_edit, start_line)
+
+    def _scroll_to_line(self, editor: QtWidgets.QPlainTextEdit, line_number: int):
+        """Scrolls the editor to make a specific line visible."""
+        doc = editor.document()
+        if line_number > doc.blockCount():
+            return
+
+        # Line numbers are 1-based, block numbers are 0-based
+        block = doc.findBlockByNumber(line_number - 1)
+        if block.isValid():
+            cursor = editor.textCursor()
+            cursor.setPosition(block.position())
+            editor.setTextCursor(cursor) # This also ensures the cursor is visible
 
     def choose_root(self):
         current = self.root_edit.text() or os.getcwd()
@@ -122,7 +144,6 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         QtWidgets.QApplication.quit()
 
-    # ---------------- Persistence (QSettings) ----------------
     def load_settings(self):
         s = QtCore.QSettings()
         geom = s.value("window/geometry")
