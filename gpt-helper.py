@@ -228,28 +228,36 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _align_views(self, source_editor, source_block, target_editor, target_line_num):
         """Scrolls the target editor to align with the source block."""
+        # 1. Get the desired Y position from the source editor's viewport.
         source_cursor = source_editor.textCursor()
         source_cursor.setPosition(source_block.position())
-        source_y = source_editor.cursorRect(source_cursor).top()
+        desired_viewport_y = source_editor.cursorRect(source_cursor).top()
 
+        # 2. Find the target block in the target editor.
         target_block = target_editor.document().findBlockByNumber(target_line_num - 1)
-        if not target_block.isValid(): return
-        
-        target_cursor = target_editor.textCursor()
-        target_cursor.setPosition(target_block.position())
-        target_y = target_editor.cursorRect(target_cursor).top()
+        if not target_block.isValid():
+            if self._debug:
+                print("[ALIGN] FAILED: Target line number is invalid.")
+            return
 
-        delta_y = target_y - source_y
+        # 3. Get the absolute Y position of the target block within the entire document.
+        # THIS IS THE CORRECTED LOGIC. We simply get the block's geometry top.
+        absolute_target_y = target_editor.blockBoundingGeometry(target_block).top()
+
+        # 4. Calculate the new scrollbar value.
+        # New Value = (Absolute position of the line) - (Desired position on screen)
+        new_scroll_val = absolute_target_y - desired_viewport_y
+
+        # 5. Set the scrollbar value.
         scrollbar = target_editor.verticalScrollBar()
         initial_scroll_val = scrollbar.value()
-        new_scroll_val = initial_scroll_val + delta_y
-        scrollbar.setValue(new_scroll_val)
-
+        
         if self._debug:
-            print("[ALIGN] Source Y:", source_y)
-            print("[ALIGN] Target Y:", target_y)
-            print("[ALIGN] Delta Y:", delta_y)
-            print(f"[ALIGN] Scrollbar: {initial_scroll_val} -> {new_scroll_val}")
+            print("[ALIGN] Desired Viewport Y (from source):", desired_viewport_y)
+            print("[ALIGN] Absolute Target Y (in document):", absolute_target_y)
+            print(f"[ALIGN] Scrollbar: {initial_scroll_val} -> {int(new_scroll_val)}")
+
+        scrollbar.setValue(int(new_scroll_val))
 
     def choose_root(self):
         current = self.root_edit.text() or os.getcwd()
