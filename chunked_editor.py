@@ -1,4 +1,3 @@
-# chunked_editor.py
 import re
 from collections import deque
 from PySide6 import QtWidgets, QtCore, QtGui
@@ -15,10 +14,11 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
     Behavior:
       - Assigns a chunk index to every block in a chunk (block.userState = chunk_idx, 0-based).
       - On hover: shows "Chunk #n", highlights the chunk, and emits a `chunkHovered` signal
-        with the chunk's file path and starting line number in the new file.
+        with the chunk's file path and its context lines for fuzzy matching.
     """
     chunks_recomputed = QtCore.Signal(int)
-    chunkHovered = QtCore.Signal(int, str, int)  # Emits (chunk_index, file_path, start_line)
+    # NEW SIGNAL: Emits (chunk_index, file_path, list_of_context_lines, first_context_block)
+    chunkHovered = QtCore.Signal(int, str, list, QtGui.QTextBlock)
 
     def __init__(self, parent=None, context_before=3, debug=False):
         super().__init__(parent)
@@ -33,7 +33,7 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._chunk_block_spans = []
         self._chunk_pos_spans = []
         self._chunk_file_paths = []
-        self._chunk_start_lines = []  # NEW: Starting line number for each chunk in the new file
+        self._chunk_context_info = []  # NEW: list of (context_lines, first_context_block)
         self._last_hover_chunk = None
 
         self._fmt_chunk_green = self._make_bg_format(QtGui.QColor(128, 255, 170, 140))
@@ -72,12 +72,6 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         return text.startswith('@@')
 
     @staticmethod
-    def _parse_hunk_start_line(text: str) -> int:
-        # Parses '@@ -1,5 +10,4 @@' -> 10
-        match = re.search(r'\+(\d+)', text)
-        return int(match.group(1)) if match else -1
-
-    @staticmethod
     def _is_add(text: str) -> bool:
         return text.startswith('+') and not text.startswith('+++')
 
@@ -114,11 +108,10 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._chunk_block_spans.clear()
         self._chunk_pos_spans.clear()
         self._chunk_file_paths.clear()
-        self._chunk_start_lines.clear()
+        self._chunk_context_info.clear()
 
         current_filepath = ""
-        hunk_header_block = None
-        hunk_start_line_in_new_file = -1
+        in_hunk = False
 
         b = doc.firstBlock()
         while b.isValid():
@@ -126,17 +119,16 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
 
             if self._is_new_file_header(t):
                 current_filepath = self._parse_filepath_from_header(t)
-                hunk_header_block = None
+                in_hunk = False
                 b = b.next()
                 continue
 
             if self._is_hunk_header(t):
-                hunk_header_block = b
-                hunk_start_line_in_new_file = self._parse_hunk_start_line(t)
+                in_hunk = True
                 b = b.next()
                 continue
 
-            if hunk_header_block is None:
+            if not in_hunk:
                 b = b.next()
                 continue
 
@@ -162,19 +154,21 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
                     chunk_start_block = context_blocks[0] if context_blocks else first_data_block
                     chunk_end_block = plus_end
 
-                    # Calculate the starting line number for this chunk
-                    line_offset = 0
-                    iter_block = hunk_header_block.next()
-                    while iter_block.isValid() and iter_block.blockNumber() < chunk_start_block.blockNumber():
-                        if not self._is_del(iter_block.text()):
-                            line_offset += 1
-                        iter_block = iter_block.next()
-                    
-                    chunk_line = hunk_start_line_in_new_file + line_offset
-
                     self._chunk_block_spans.append((chunk_start_block.blockNumber(), chunk_end_block.blockNumber()))
                     self._chunk_file_paths.append(current_filepath)
-                    self._chunk_start_lines.append(chunk_line)
+
+                    # NEW: Collect context lines and the first context block for this chunk
+                    chunk_context_lines = []
+                    first_context_block = None
+                    iter_block = chunk_start_block
+                    while iter_block.isValid() and iter_block.blockNumber() <= chunk_end_block.blockNumber():
+                        if self._is_ctx(iter_block.text()):
+                            # Store the text without the leading space
+                            chunk_context_lines.append(iter_block.text()[1:])
+                            if first_context_block is None:
+                                first_context_block = iter_block
+                        iter_block = iter_block.next()
+                    self._chunk_context_info.append((chunk_context_lines, first_context_block))
 
                     b = curp
                     continue
@@ -224,12 +218,12 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
                 self._last_hover_chunk = idx
                 QtWidgets.QToolTip.showText(self.mapToGlobal(event.pos()), f"Chunk #{idx + 1}", self)
                 filepath = self._chunk_file_paths[idx]
-                start_line = self._chunk_start_lines[idx]
-                self.chunkHovered.emit(idx, filepath, start_line)
+                context_lines, first_context_block = self._chunk_context_info[idx]
+                self.chunkHovered.emit(idx, filepath, context_lines, first_context_block)
             self._apply_chunk_highlight(idx)
         else:
             if self._last_hover_chunk is not None:
-                self.chunkHovered.emit(-1, "", -1)
+                self.chunkHovered.emit(-1, "", [], None)
             self._last_hover_chunk = None
             QtWidgets.QToolTip.hideText()
             self._clear_highlight()
@@ -240,7 +234,7 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._last_hover_chunk = None
         QtWidgets.QToolTip.hideText()
         self._clear_highlight()
-        self.chunkHovered.emit(-1, "", -1)
+        self.chunkHovered.emit(-1, "", [], None)
         super().leaveEvent(event)
 
     def chunk_count(self) -> int:

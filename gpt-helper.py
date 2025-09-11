@@ -3,10 +3,101 @@ import os
 from PySide6 import QtWidgets, QtCore, QtGui
 from chunked_editor import ChunkedPlainTextEdit
 
+# You must run: pip install thefuzz python-Levenshtein
+from thefuzz import fuzz
+
 # App identity for QSettings
 QtCore.QCoreApplication.setOrganizationName("Grant")
 QtCore.QCoreApplication.setOrganizationDomain("grantech.co")
 QtCore.QCoreApplication.setApplicationName("InteractivePatchHelper")
+
+
+# --- Helper classes for the line number feature ---
+
+class LineNumberArea(QtWidgets.QWidget):
+    """A widget that draws line numbers for a QPlainTextEdit."""
+    def __init__(self, editor):
+        super().__init__(editor)
+        self.editor = editor
+
+    def sizeHint(self):
+        return QtCore.QSize(self.editor.lineNumberAreaWidth(), 0)
+
+    def paintEvent(self, event):
+        self.editor.lineNumberAreaPaintEvent(event)
+
+
+class CodeEditor(QtWidgets.QPlainTextEdit):
+    """A QPlainTextEdit with a line number area."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.lineNumberArea = LineNumberArea(self)
+
+        self.blockCountChanged.connect(self.updateLineNumberAreaWidth)
+        self.updateRequest.connect(self.updateLineNumberArea)
+        self.cursorPositionChanged.connect(self.highlightCurrentLine)
+
+        self.updateLineNumberAreaWidth(0)
+        self.highlightCurrentLine()
+
+    def lineNumberAreaWidth(self):
+        digits = 1
+        count = max(1, self.blockCount())
+        while count >= 10:
+            count /= 10
+            digits += 1
+        space = 10 + self.fontMetrics().horizontalAdvance('9') * digits
+        return space
+
+    def updateLineNumberAreaWidth(self, _):
+        self.setViewportMargins(self.lineNumberAreaWidth(), 0, 0, 0)
+
+    def updateLineNumberArea(self, rect, dy):
+        if dy:
+            self.lineNumberArea.scroll(0, dy)
+        else:
+            self.lineNumberArea.update(0, rect.y(), self.lineNumberArea.width(), rect.height())
+
+        if rect.contains(self.viewport().rect()):
+            self.updateLineNumberAreaWidth(0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        cr = self.contentsRect()
+        self.lineNumberArea.setGeometry(QtCore.QRect(cr.left(), cr.top(), self.lineNumberAreaWidth(), cr.height()))
+
+    def highlightCurrentLine(self):
+        extraSelections = []
+        if not self.isReadOnly():
+            selection = QtWidgets.QTextEdit.ExtraSelection()
+            lineColor = QtGui.QColor(QtCore.Qt.yellow).lighter(160)
+            selection.format.setBackground(lineColor)
+            selection.format.setProperty(QtGui.QTextFormat.FullWidthSelection, True)
+            selection.cursor = self.textCursor()
+            selection.cursor.clearSelection()
+            extraSelections.append(selection)
+        self.setExtraSelections(extraSelections)
+
+    def lineNumberAreaPaintEvent(self, event):
+        painter = QtGui.QPainter(self.lineNumberArea)
+        painter.fillRect(event.rect(), QtCore.Qt.lightGray)
+
+        block = self.firstVisibleBlock()
+        blockNumber = block.blockNumber()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        bottom = top + self.blockBoundingRect(block).height()
+
+        while block.isValid() and top <= event.rect().bottom():
+            if block.isVisible() and bottom >= event.rect().top():
+                number = str(blockNumber + 1)
+                painter.setPen(QtCore.Qt.black)
+                painter.drawText(0, int(top), self.lineNumberArea.width() - 5, self.fontMetrics().height(),
+                                 QtCore.Qt.AlignRight, number)
+
+            block = block.next()
+            top = bottom
+            bottom = top + self.blockBoundingRect(block).height()
+            blockNumber += 1
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -22,16 +113,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Top controls
         top_row = QtWidgets.QHBoxLayout()
         layout.addLayout(top_row)
-
         self.root_edit = QtWidgets.QLineEdit()
         self.root_edit.setReadOnly(True)
         choose_btn = QtWidgets.QPushButton("Choose Root…")
         choose_btn.clicked.connect(self.choose_root)
         self.debug_check = QtWidgets.QCheckBox("Debug logs")
-        self.debug_check.stateChanged.connect(self._toggle_debug)
+        self.debug_check.stateChanged.connect(self._on_debug_toggled)
         self.relaunch_btn = QtWidgets.QPushButton("Relaunch")
         self.relaunch_btn.clicked.connect(self.relaunch_app)
-
         top_row.addWidget(QtWidgets.QLabel("Root:"))
         top_row.addWidget(self.root_edit, stretch=1)
         top_row.addWidget(choose_btn)
@@ -48,76 +137,119 @@ class MainWindow(QtWidgets.QMainWindow):
         self.patch_edit.chunkHovered.connect(self._on_chunk_hovered)
 
         # Right: File viewer
-        self.file_viewer_edit = QtWidgets.QPlainTextEdit()
-        self.file_viewer_edit.setReadOnly(True)
-        self.file_viewer_edit.setPlaceholderText("Hover over a chunk on the left to see the corresponding file here.")
+        self.file_viewer = CodeEditor()
+        self.file_viewer.setReadOnly(True)
+        self.file_viewer.setPlaceholderText("Hover over a chunk on the left to see the corresponding file here.")
         fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
-        self.file_viewer_edit.setFont(fixed_font)
+        self.file_viewer.setFont(fixed_font)
 
         splitter.addWidget(self.patch_edit)
-        splitter.addWidget(self.file_viewer_edit)
+        splitter.addWidget(self.file_viewer)
         splitter.setSizes([600, 600])
 
-        # Status bar
         self.statusBar().showMessage("Ready")
 
-        # Load persisted settings
+        # --- MODIFIED: Add debug flag ---
+        self._debug = True #self.debug_check.isChecked()
+
         self.load_settings()
 
-    @QtCore.Slot(int, str, int)
-    def _on_chunk_hovered(self, chunk_idx: int, file_path: str, start_line: int):
-        """Loads file content and scrolls to the correct line."""
+    @QtCore.Slot(int, str, list, QtGui.QTextBlock)
+    def _on_chunk_hovered(self, chunk_idx: int, file_path: str, context_lines: list, first_context_block: QtGui.QTextBlock):
+        """Loads file, fuzzy finds context, and aligns views."""
         if chunk_idx == -1 or not file_path:
-            # Don't clear the viewer, just stop updating
             return
+
+        if self._debug:
+            print("\n" + "="*20 + f" HOVER CHUNK #{chunk_idx+1} " + "="*20)
+            print(f"File Path: {file_path}")
+            print("Context lines to search for:")
+            for line in context_lines:
+                print(f"  > {line}")
+            print("-"*58)
 
         root_dir = self.root_edit.text()
         if not root_dir:
-            self.file_viewer_edit.setPlainText("ERROR: Root directory is not set.\n\nPlease choose a root directory first.")
+            self.file_viewer.setPlainText("ERROR: Root directory is not set.")
             return
 
         full_path = os.path.join(root_dir, file_path)
-
-        # Avoid reloading if the file is already displayed
-        current_path = self.file_viewer_edit.property("current_file")
+        current_path = self.file_viewer.property("current_file")
         if current_path != full_path:
             try:
                 if os.path.isfile(full_path):
                     with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
-                    self.file_viewer_edit.setPlainText(content)
-                    self.file_viewer_edit.setProperty("current_file", full_path)
+                    self.file_viewer.setPlainText(content)
+                    self.file_viewer.setProperty("current_file", full_path)
                     self.statusBar().showMessage(f"Showing: {file_path}", 4000)
                 else:
-                    self.file_viewer_edit.setPlainText(
-                        f"File not found at the specified path.\n\n"
-                        f"Root: {root_dir}\n"
-                        f"File: {file_path}\n"
-                        f"Full Path: {full_path}"
-                    )
-                    self.file_viewer_edit.setProperty("current_file", None)
+                    self.file_viewer.setPlainText(f"File not found: {full_path}")
+                    self.file_viewer.setProperty("current_file", None)
                     self.statusBar().showMessage(f"File not found: {file_path}", 4000)
             except Exception as e:
-                self.file_viewer_edit.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
-                self.file_viewer_edit.setProperty("current_file", None)
+                self.file_viewer.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
+                self.file_viewer.setProperty("current_file", None)
                 self.statusBar().showMessage(f"Error reading {file_path}", 4000)
         
-        # Now, scroll to the line
-        if start_line > 0:
-            self._scroll_to_line(self.file_viewer_edit, start_line)
+        if context_lines and first_context_block and first_context_block.isValid():
+            target_lines = self.file_viewer.toPlainText().splitlines()
+            match_line_num = self._find_best_match(target_lines, context_lines)
+            
+            if match_line_num is not None:
+                self._align_views(self.patch_edit, first_context_block, self.file_viewer, match_line_num)
 
-    def _scroll_to_line(self, editor: QtWidgets.QPlainTextEdit, line_number: int):
-        """Scrolls the editor to make a specific line visible."""
-        doc = editor.document()
-        if line_number > doc.blockCount():
-            return
+    def _find_best_match(self, target_lines: list, query_lines: list, min_score=75) -> int | None:
+        """Finds the best fuzzy match for a block of lines."""
+        if not query_lines or not target_lines:
+            if self._debug: print("[FUZZY] Canceled: No query or target lines.")
+            return None
 
-        # Line numbers are 1-based, block numbers are 0-based
-        block = doc.findBlockByNumber(line_number - 1)
-        if block.isValid():
-            cursor = editor.textCursor()
-            cursor.setPosition(block.position())
-            editor.setTextCursor(cursor) # This also ensures the cursor is visible
+        query_str = "\n".join(query_lines)
+        num_query_lines = len(query_lines)
+        best_score, best_line_num = -1, -1
+
+        for i in range(len(target_lines) - num_query_lines + 1):
+            window_lines = target_lines[i : i + num_query_lines]
+            window_str = "\n".join(window_lines)
+            score = fuzz.ratio(query_str, window_str)
+            if score > best_score:
+                best_score = score
+                best_line_num = i + 1
+
+        if self._debug:
+            print(f"[FUZZY] Best match score: {best_score}")
+            if best_score >= min_score:
+                print(f"[FUZZY] SUCCESS: Found match at line {best_line_num} (score >= {min_score})")
+            else:
+                print(f"[FUZZY] FAILED: Best score is below threshold of {min_score}")
+
+        return best_line_num if best_score >= min_score else None
+
+    def _align_views(self, source_editor, source_block, target_editor, target_line_num):
+        """Scrolls the target editor to align with the source block."""
+        source_cursor = source_editor.textCursor()
+        source_cursor.setPosition(source_block.position())
+        source_y = source_editor.cursorRect(source_cursor).top()
+
+        target_block = target_editor.document().findBlockByNumber(target_line_num - 1)
+        if not target_block.isValid(): return
+        
+        target_cursor = target_editor.textCursor()
+        target_cursor.setPosition(target_block.position())
+        target_y = target_editor.cursorRect(target_cursor).top()
+
+        delta_y = target_y - source_y
+        scrollbar = target_editor.verticalScrollBar()
+        initial_scroll_val = scrollbar.value()
+        new_scroll_val = initial_scroll_val + delta_y
+        scrollbar.setValue(new_scroll_val)
+
+        if self._debug:
+            print("[ALIGN] Source Y:", source_y)
+            print("[ALIGN] Target Y:", target_y)
+            print("[ALIGN] Delta Y:", delta_y)
+            print(f"[ALIGN] Scrollbar: {initial_scroll_val} -> {new_scroll_val}")
 
     def choose_root(self):
         current = self.root_edit.text() or os.getcwd()
@@ -126,10 +258,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.root_edit.setText(directory)
             self.statusBar().showMessage(f"Root directory set to: {directory}", 3000)
 
-    def _toggle_debug(self, state: int):
-        on = state == QtCore.Qt.Checked
-        self.patch_edit.set_debug(on)
+    # --- MODIFIED: Renamed and updated to control debug flag ---
+    def _on_debug_toggled(self, state: int):
+        on = (state == QtCore.Qt.Checked)
+        self._debug = on
+        self.patch_edit.set_debug(on) # Keep passing to child widget
         self.statusBar().showMessage("Debug logging " + ("enabled" if on else "disabled"), 2000)
+        if on:
+            print("\n--- Debug logging enabled ---")
+        else:
+            print("\n--- Debug logging disabled ---")
 
     def relaunch_app(self):
         self.save_settings()
@@ -137,7 +275,6 @@ class MainWindow(QtWidgets.QMainWindow):
             program, arguments, workdir = sys.argv[0], sys.argv[1:], os.path.dirname(sys.argv[0])
         else:
             program, arguments, workdir = sys.executable, sys.argv, os.getcwd()
-
         ok = QtCore.QProcess.startDetached(program, arguments, workdir)
         if not ok:
             QtWidgets.QMessageBox.critical(self, "Relaunch", "Failed to start a new process.")
@@ -154,6 +291,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.root_edit.setText(root)
         text = s.value("app/patchText", "", type=str)
         if text: self.patch_edit.setPlainText(text)
+        # --- MODIFIED: Load debug checkbox state ---
+        debug_on = s.value("app/debug", False, type=bool)
+        self.debug_check.setChecked(debug_on)
 
     def save_settings(self):
         s = QtCore.QSettings()
@@ -161,6 +301,8 @@ class MainWindow(QtWidgets.QMainWindow):
         s.setValue("window/state", self.saveState())
         s.setValue("app/rootDir", self.root_edit.text())
         s.setValue("app/patchText", self.patch_edit.toPlainText())
+        # --- MODIFIED: Save debug checkbox state ---
+        s.setValue("app/debug", self.debug_check.isChecked())
         s.sync()
 
     def closeEvent(self, event: QtGui.QCloseEvent):
