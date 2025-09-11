@@ -12,8 +12,8 @@ QtCore.QCoreApplication.setApplicationName("InteractivePatchHelper")
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Interactive Patch Helper (refactored)")
-        self.resize(1000, 700)
+        self.setWindowTitle("Interactive Patch Helper")
+        self.resize(1200, 800)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -25,15 +25,10 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.root_edit = QtWidgets.QLineEdit()
         self.root_edit.setReadOnly(True)
-
         choose_btn = QtWidgets.QPushButton("Choose Root…")
         choose_btn.clicked.connect(self.choose_root)
-
-        # Debug checkbox
         self.debug_check = QtWidgets.QCheckBox("Debug logs")
         self.debug_check.stateChanged.connect(self._toggle_debug)
-
-        # Relaunch button
         self.relaunch_btn = QtWidgets.QPushButton("Relaunch")
         self.relaunch_btn.clicked.connect(self.relaunch_app)
 
@@ -43,16 +38,64 @@ class MainWindow(QtWidgets.QMainWindow):
         top_row.addWidget(self.debug_check)
         top_row.addWidget(self.relaunch_btn)
 
-        # Patch editor: chunking by contiguous '+' with optional preceding '-' and up to 3 context lines
+        # Main editor area with a splitter
+        splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
+        layout.addWidget(splitter, stretch=1)
+
+        # Left: Patch editor
         self.patch_edit = ChunkedPlainTextEdit(context_before=3, debug=False)
         self.patch_edit.setPlaceholderText("Paste patch text here…")
-        layout.addWidget(self.patch_edit, stretch=1)
+        self.patch_edit.chunkHovered.connect(self._on_chunk_hovered)
+
+        # Right: File viewer
+        self.file_viewer_edit = QtWidgets.QPlainTextEdit()
+        self.file_viewer_edit.setReadOnly(True)
+        self.file_viewer_edit.setPlaceholderText("Hover over a chunk on the left to see the corresponding file here.")
+        fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
+        self.file_viewer_edit.setFont(fixed_font)
+
+        splitter.addWidget(self.patch_edit)
+        splitter.addWidget(self.file_viewer_edit)
+        splitter.setSizes([600, 600]) # Initial equal sizing
 
         # Status bar
         self.statusBar().showMessage("Ready")
 
         # Load persisted settings
         self.load_settings()
+
+    @QtCore.Slot(int, str)
+    def _on_chunk_hovered(self, chunk_idx: int, file_path: str):
+        """Loads file content into the right pane when a chunk is hovered."""
+        if chunk_idx == -1 or not file_path:
+            if self.file_viewer_edit.toPlainText():
+                self.file_viewer_edit.clear()
+            return
+
+        root_dir = self.root_edit.text()
+        if not root_dir:
+            self.file_viewer_edit.setPlainText("ERROR: Root directory is not set.\n\nPlease choose a root directory first.")
+            return
+
+        full_path = os.path.join(root_dir, file_path)
+
+        try:
+            if os.path.isfile(full_path):
+                with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+                    content = f.read()
+                self.file_viewer_edit.setPlainText(content)
+                self.statusBar().showMessage(f"Showing: {file_path}", 4000)
+            else:
+                self.file_viewer_edit.setPlainText(
+                    f"File not found at the specified path.\n\n"
+                    f"Root: {root_dir}\n"
+                    f"File: {file_path}\n"
+                    f"Full Path: {full_path}"
+                )
+                self.statusBar().showMessage(f"File not found: {file_path}", 4000)
+        except Exception as e:
+            self.file_viewer_edit.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
+            self.statusBar().showMessage(f"Error reading {file_path}", 4000)
 
     def choose_root(self):
         current = self.root_edit.text() or os.getcwd()
@@ -67,21 +110,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Debug logging " + ("enabled" if on else "disabled"), 2000)
 
     def relaunch_app(self):
-        # Save settings first
-        try:
-            self.save_settings()
-        except Exception:
-            pass
-
-        # Restart the process
+        self.save_settings()
         if getattr(sys, "frozen", False):
-            program = sys.argv[0]
-            arguments = sys.argv[1:]
-            workdir = os.path.dirname(program) or os.getcwd()
+            program, arguments, workdir = sys.argv[0], sys.argv[1:], os.path.dirname(sys.argv[0])
         else:
-            program = sys.executable
-            arguments = sys.argv
-            workdir = os.getcwd()
+            program, arguments, workdir = sys.executable, sys.argv, os.getcwd()
 
         ok = QtCore.QProcess.startDetached(program, arguments, workdir)
         if not ok:
@@ -92,24 +125,14 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------- Persistence (QSettings) ----------------
     def load_settings(self):
         s = QtCore.QSettings()
-        # Window geometry/state
-        geom = s.value("window/geometry", None)
-        state = s.value("window/state", None)
-        if geom is not None:
-            self.restoreGeometry(geom)
-        if state is not None:
-            self.restoreState(state)
-
-        # Root directory
-        root = s.value("app/rootDir", "", type=str)
-        if not root:
-            root = os.getcwd()
+        geom = s.value("window/geometry")
+        state = s.value("window/state")
+        if geom: self.restoreGeometry(geom)
+        if state: self.restoreState(state)
+        root = s.value("app/rootDir", os.getcwd(), type=str)
         self.root_edit.setText(root)
-
-        # Patch editor content
         text = s.value("app/patchText", "", type=str)
-        if text:
-            self.patch_edit.setPlainText(text)
+        if text: self.patch_edit.setPlainText(text)
 
     def save_settings(self):
         s = QtCore.QSettings()
