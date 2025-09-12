@@ -17,8 +17,10 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         with the chunk's file path and its context lines for fuzzy matching.
     """
     chunks_recomputed = QtCore.Signal(int)
-    # NEW SIGNAL: Emits (chunk_index, file_path, list_of_context_lines, first_context_block)
+    # Emits (chunk_index, file_path, list_of_context_lines, first_context_block)
     chunkHovered = QtCore.Signal(int, str, list, QtGui.QTextBlock)
+    # NEW: Emitted when the user chooses "Apply" via context menu on a chunk
+    chunkApplyRequested = QtCore.Signal(int)
 
     def __init__(self, parent=None, context_before=3, debug=False):
         super().__init__(parent)
@@ -33,7 +35,7 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._chunk_block_spans = []
         self._chunk_pos_spans = []
         self._chunk_file_paths = []
-        self._chunk_context_info = []  # NEW: list of (context_lines, first_context_block)
+        self._chunk_context_info = []  # list of (context_lines, first_context_block)
         self._last_hover_chunk = None
 
         self._fmt_chunk_green = self._make_bg_format(QtGui.QColor(128, 255, 170, 140))
@@ -63,7 +65,8 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
     @staticmethod
     def _parse_filepath_from_header(text: str) -> str:
         parts = text.split(maxsplit=1)
-        if len(parts) < 2: return ""
+        if len(parts) < 2:
+            return ""
         path_part = parts[1]
         return path_part[2:] if path_part.startswith('b/') else path_part
 
@@ -92,9 +95,11 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         b = first_data_block.previous()
         while b.isValid() and len(out) < limit:
             t = b.text()
-            if self._is_hunk_header(t): break
+            if self._is_hunk_header(t):
+                break
             if self._is_ctx(t):
-                if self._ctx_has_content(t): out.insert(0, b)
+                if self._ctx_has_content(t):
+                    out.insert(0, b)
                 b = b.previous()
             else:
                 break
@@ -137,7 +142,8 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
                 minus_start, minus_end = None, None
                 cur = start_search_block
                 while cur.isValid() and self._is_del(cur.text()):
-                    if minus_start is None: minus_start = cur
+                    if minus_start is None:
+                        minus_start = cur
                     minus_end = cur
                     cur = cur.next()
 
@@ -157,13 +163,12 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
                     self._chunk_block_spans.append((chunk_start_block.blockNumber(), chunk_end_block.blockNumber()))
                     self._chunk_file_paths.append(current_filepath)
 
-                    # NEW: Collect context lines and the first context block for this chunk
+                    # Collect context lines and the first context block for this chunk
                     chunk_context_lines = []
                     first_context_block = None
                     iter_block = chunk_start_block
                     while iter_block.isValid() and iter_block.blockNumber() <= chunk_end_block.blockNumber():
                         if self._is_ctx(iter_block.text()):
-                            # Store the text without the leading space
                             chunk_context_lines.append(iter_block.text()[1:])
                             if first_context_block is None:
                                 first_context_block = iter_block
@@ -178,6 +183,7 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
 
             b = b.next()
 
+        # Mark and store position spans
         for idx, (bn_start, bn_end) in enumerate(self._chunk_block_spans):
             start_block = doc.findBlockByNumber(bn_start)
             end_block = doc.findBlockByNumber(bn_end)
@@ -236,6 +242,21 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._clear_highlight()
         self.chunkHovered.emit(-1, "", [], None)
         super().leaveEvent(event)
+
+    def contextMenuEvent(self, event: QtGui.QContextMenuEvent):
+        # Determine if the cursor is over a chunk
+        cursor = self.cursorForPosition(event.pos())
+        block = cursor.block()
+        idx = block.userState() if block.isValid() else -1
+
+        if idx is None or idx < 0:
+            return super().contextMenuEvent(event)
+
+        menu = QtWidgets.QMenu(self)
+        act_apply = menu.addAction(f"Apply Chunk #{idx + 1}")
+        chosen = menu.exec(event.globalPos())
+        if chosen == act_apply:
+            self.chunkApplyRequested.emit(idx)
 
     def chunk_count(self) -> int:
         return self._chunk_count

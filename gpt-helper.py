@@ -156,6 +156,8 @@ class MainWindow(QtWidgets.QMainWindow):
         # Recommended: no wrapping for more stable geometry
         self.patch_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.patch_edit.chunkHovered.connect(self._on_chunk_hovered)
+        # NEW: connect Apply action from context menu (UI signal)
+        self.patch_edit.chunkApplyRequested.connect(self._on_chunk_apply_requested)
 
         # Right: File viewer
         self.file_viewer = CodeEditor()
@@ -173,7 +175,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().showMessage("Ready")
 
         # Debug flag
-        self._debug = True  # You can default to self.debug_check.isChecked() if you prefer
+        self._debug = True  # or self.debug_check.isChecked()
 
         self.load_settings()
 
@@ -186,12 +188,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         if self._debug:
-            print("\n" + "="*20 + f" HOVER CHUNK #{chunk_idx+1} " + "="*20)
+            print("\n" + "=" * 20 + f" HOVER CHUNK #{chunk_idx + 1} " + "=" * 20)
             print(f"File Path: {file_path}")
             print("Context lines to search for:")
             for line in context_lines:
                 print(f"  > {line}")
-            print("-"*58)
+            print("-" * 58)
 
         root_dir = self.root_edit.text()
         if not root_dir:
@@ -322,6 +324,12 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._debug:
             print(f"[HILITE] Highlighting lines {start_idx + 1}..{end_idx + 1}")
+
+    @QtCore.Slot(int)
+    def _on_chunk_apply_requested(self, chunk_idx: int):
+        # UI-only example: in real use you’d implement actual apply logic here
+        if self._debug:
+            print(f"[APPLY] User chose to apply chunk #{chunk_idx + 1} (index {chunk_idx})")
 
     def choose_root(self):
         current = self.root_edit.text() or os.getcwd()
