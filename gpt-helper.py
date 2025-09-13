@@ -1,6 +1,5 @@
 import sys
 import os
-import tempfile
 from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 from chunked_editor import ChunkedPlainTextEdit
@@ -58,7 +57,7 @@ class CodeEditor(QtWidgets.QPlainTextEdit):
         digits = 1
         count = max(1, self.blockCount())
         while count >= 10:
-            count /= 10
+            count //= 10
             digits += 1
         space = 10 + self.fontMetrics().horizontalAdvance('9') * digits
         return space
@@ -142,11 +141,17 @@ class MainWindow(QtWidgets.QMainWindow):
         self.debug_check.stateChanged.connect(self._on_debug_toggled)
         self.relaunch_btn = QtWidgets.QPushButton("Relaunch")
         self.relaunch_btn.clicked.connect(self.relaunch_app)
+        # Apply button for hovered chunk (enabled/disabled dynamically)
+        self.apply_btn = QtWidgets.QPushButton("Apply Hovered Chunk")
+        self.apply_btn.setEnabled(False)
+        self.apply_btn.clicked.connect(self._apply_hovered_chunk_if_possible)
+
         top_row.addWidget(QtWidgets.QLabel("Root:"))
         top_row.addWidget(self.root_edit, stretch=1)
         top_row.addWidget(choose_btn)
         top_row.addWidget(self.debug_check)
         top_row.addWidget(self.relaunch_btn)
+        top_row.addWidget(self.apply_btn)
 
         # Main editor area with a splitter
         splitter = QtWidgets.QSplitter(QtCore.Qt.Horizontal)
@@ -155,19 +160,17 @@ class MainWindow(QtWidgets.QMainWindow):
         # Left: Patch editor
         self.patch_edit = ChunkedPlainTextEdit(context_before=3, debug=False)
         self.patch_edit.setPlaceholderText("Paste patch text here…")
-        # For stable geometry
         self.patch_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.patch_edit.chunkHovered.connect(self._on_chunk_hovered)
-        # Context menu "Apply Chunk" handler
         self.patch_edit.chunkApplyRequested.connect(self._on_chunk_apply_requested)
 
-        # Right: File viewer
+        # Right: File viewer (single source of truth for current file buffer)
         self.file_viewer = CodeEditor()
-        self.file_viewer.setReadOnly(True)
-        self.file_viewer.setPlaceholderText("Hover over a chunk on the left to see the corresponding file here.")
+        # Allow direct editing by default (in-memory only)
+        self.file_viewer.setReadOnly(False)
+        self.file_viewer.setPlaceholderText("Hover a chunk on the left; the file will load here if the view is empty.")
         fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         self.file_viewer.setFont(fixed_font)
-        # For stable geometry
         self.file_viewer.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
 
         splitter.addWidget(self.patch_edit)
@@ -176,180 +179,241 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage("Ready")
 
-        # Debug flag (toggle with checkbox if you prefer)
+        # Debug flag
         self._debug = True
+
+        # Track current hovered chunk info
+        self._hover_chunk_idx: int | None = None
+        self._hover_chunk_file: str | None = None
+        self._hover_context_lines: list[str] = []
+        self._hover_applicable: bool = False
+        self._hover_already_applied: bool = False
+        self._hover_apply_start_idx: int | None = None
+        self._hover_highlight_len: int = 0
+
+        # When user edits the right buffer, clear stale highlights and re-evaluate current hover state (debounced)
+        self._debounce_timer = QtCore.QTimer(self)
+        self._debounce_timer.setSingleShot(True)
+        self._debounce_timer.setInterval(150)
+        self.file_viewer.textChanged.connect(self._on_file_text_changed)
 
         self.load_settings()
 
+    def current_view_file(self) -> str | None:
+        v = self.file_viewer.property("current_file")
+        return str(v) if v else None
+
+    def is_view_empty(self) -> bool:
+        return (self.file_viewer.toPlainText() == "") and (self.current_view_file() is None)
+
+    @QtCore.Slot()
+    def _on_file_text_changed(self):
+        # Clear transient highlight and re-evaluate applicability after a short debounce
+        self.file_viewer.clearExternalSelections()
+        self._debounce_timer.timeout.connect(self._reevaluate_hover_state_once)
+        self._debounce_timer.start()
+
+    @QtCore.Slot()
+    def _reevaluate_hover_state_once(self):
+        self._debounce_timer.timeout.disconnect(self._reevaluate_hover_state_once)
+        if self._hover_chunk_idx is None or self._hover_chunk_idx < 0:
+            self.apply_btn.setEnabled(False)
+            return
+        # Re-run applicability based on current buffer
+        self._evaluate_and_update_ui_for_hovered_chunk()
+
     @QtCore.Slot(int, str, list, QtGui.QTextBlock)
     def _on_chunk_hovered(self, chunk_idx: int, file_path: str, context_lines: list, first_context_block: QtGui.QTextBlock):
-        """Loads file, fuzzy finds context, aligns the view, and highlights the matched context."""
+        """
+        Loads file only if the right panel is empty; otherwise reuses current buffer.
+        Computes applicability of hovered chunk against the current buffer and updates apply button and highlight.
+        """
         # Clear when leaving a chunk
         if chunk_idx == -1 or not file_path:
+            self._hover_chunk_idx = None
+            self._hover_chunk_file = None
+            self._hover_context_lines = []
+            self._hover_applicable = False
+            self._hover_already_applied = False
+            self._hover_apply_start_idx = None
+            self._hover_highlight_len = 0
             self.file_viewer.clearExternalSelections()
+            self.apply_btn.setEnabled(False)
             return
+
+        # Update hover context
+        self._hover_chunk_idx = chunk_idx
+        self._hover_chunk_file = file_path.replace("\\", "/")
+        self._hover_context_lines = list(context_lines)
 
         if self._debug:
             print("\n" + "=" * 20 + f" HOVER CHUNK #{chunk_idx + 1} " + "=" * 20)
-            print(f"File Path: {file_path}")
+            print(f"File Path (rel): {self._hover_chunk_file}")
             print("Context lines to search for:")
             for line in context_lines:
                 print(f"  > {line}")
             print("-" * 58)
 
-        root_dir = self.root_edit.text()
+        # Resolve full path (for loading if needed)
+        root_dir = self.root_edit.text().strip()
         if not root_dir:
-            self.file_viewer.setPlainText("ERROR: Root directory is not set.")
-            self.file_viewer.clearExternalSelections()
+            self.statusBar().showMessage("Root directory not set.", 3000)
+            self.apply_btn.setEnabled(False)
             return
 
-        # Normalize build path
         root = Path(root_dir).expanduser()
-        rel = Path(file_path.replace("\\", "/"))
+        rel = Path(self._hover_chunk_file)
         full_path = (root / rel).resolve(strict=False)
 
-        current_path = self.file_viewer.property("current_file")
-        if current_path != str(full_path):
-            try:
-                if full_path.is_file():
-                    with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
+        # Load only if right panel is empty
+        current_path = self.current_view_file()
+        if self.is_view_empty():
+            # Try to load file if it exists; otherwise, keep an empty buffer but set current_file property
+            if full_path.is_file():
+                try:
+                    with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
                     self.file_viewer.setPlainText(content)
                     self.file_viewer.setProperty("current_file", str(full_path))
-                    self.statusBar().showMessage(f"Showing: {rel.as_posix()}", 4000)
-                else:
-                    self.file_viewer.setPlainText(f"File not found: {full_path}")
-                    self.file_viewer.setProperty("current_file", None)
-                    self.file_viewer.clearExternalSelections()
-                    self.statusBar().showMessage(f"File not found: {rel.as_posix()}", 4000)
-                    return
-            except Exception as e:
-                self.file_viewer.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
-                self.file_viewer.setProperty("current_file", None)
+                    self.statusBar().showMessage(f"Loaded: {rel.as_posix()}", 4000)
+                except Exception as e:
+                    self.file_viewer.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
+                    self.file_viewer.setProperty("current_file", str(full_path))
+                    self.statusBar().showMessage(f"Error reading {rel.as_posix()}", 4000)
+            else:
+                # Start with empty buffer but remember target file path
+                self.file_viewer.setPlainText("")
+                self.file_viewer.setProperty("current_file", str(full_path))
+                self.statusBar().showMessage(f"File not found; editing new buffer: {rel.as_posix()}", 4000)
+        else:
+            # Reuse existing buffer; if it's a different file, do not switch
+            if current_path and Path(current_path) != full_path:
+                self.statusBar().showMessage(
+                    f"Right panel has {Path(current_path).name}; chunk is for {rel.as_posix()}. Not switching.", 5000
+                )
+                self.apply_btn.setEnabled(False)
                 self.file_viewer.clearExternalSelections()
-                self.statusBar().showMessage(f"Error reading {rel.as_posix()}", 4000)
                 return
 
-        # With content loaded, try to find and align/highlight the matching context
-        if context_lines and first_context_block and first_context_block.isValid():
-            target_lines = self.file_viewer.toPlainText().splitlines()
-            match_line_num = self._find_best_match(target_lines, context_lines)
+        # Evaluate applicability and update highlight/UI
+        self._evaluate_and_update_ui_for_hovered_chunk()
 
-            if match_line_num is not None:
-                # Align: top-align the first matched line (simple and robust)
-                self._scroll_target_line_to_top(self.file_viewer, match_line_num)
-                # Highlight exactly the matched context block
-                self._highlight_context_in_file_viewer(match_line_num, len(context_lines))
-            else:
-                # No match => clear highlight
-                self.file_viewer.clearExternalSelections()
+    def _evaluate_and_update_ui_for_hovered_chunk(self):
+        """Evaluate applicability of the currently hovered chunk against the current buffer. Update UI accordingly."""
+        if self._hover_chunk_idx is None or not self._hover_chunk_file:
+            self.apply_btn.setEnabled(False)
+            return
+
+        # Extract details for hovered chunk
+        details = self.patch_edit.get_chunk_details(self._hover_chunk_idx)
+        if not details:
+            self.apply_btn.setEnabled(False)
+            return
+
+        # Ensure file path matches the loaded buffer (we already constrained on hover, but double-check)
+        current_path = self.current_view_file()
+        if not current_path or (self._hover_chunk_file not in str(current_path).replace("\\", "/")):
+            self.apply_btn.setEnabled(False)
+            return
+
+        # Compute match and applicability on current buffer
+        lines = self.file_viewer.toPlainText().splitlines()
+        match_line_num = self._find_best_match(lines, details["context_lines"], min_score=60)
+        applicable, already_applied, apply_start_idx, highlight_len = self._evaluate_chunk_applicability(
+            lines, details, match_line_num
+        )
+
+        self._hover_applicable = applicable
+        self._hover_already_applied = already_applied
+        self._hover_apply_start_idx = apply_start_idx
+        self._hover_highlight_len = highlight_len
+
+        # Scroll and highlight if we have a context match
+        if match_line_num is not None:
+            self._scroll_target_line_to_top(self.file_viewer, match_line_num)
+            # Highlight context (blue) or applied region will be highlighted when applied
+            self._highlight_context_in_file_viewer(match_line_num, details["n_context"])
+        else:
+            self.file_viewer.clearExternalSelections()
+
+        # Update Apply button state
+        if already_applied:
+            self.apply_btn.setEnabled(False)
+            self.apply_btn.setToolTip("Chunk already applied to current buffer.")
+        elif applicable:
+            self.apply_btn.setEnabled(True)
+            self.apply_btn.setToolTip("Apply this chunk to the current buffer.")
+        else:
+            self.apply_btn.setEnabled(False)
+            self.apply_btn.setToolTip("Context not found or ambiguous in current buffer.")
 
     @QtCore.Slot(int)
     def _on_chunk_apply_requested(self, chunk_idx: int):
-        """Apply the chosen chunk: locate context, remove '-' lines, insert '+' lines, and write the file."""
-        details = self.patch_edit.get_chunk_details(chunk_idx)
+        """Apply from the left context menu; internally this delegates to the same logic as the top button."""
+        # Only apply if this is the currently hovered chunk
+        if self._hover_chunk_idx != chunk_idx:
+            # Recompute hover info for this chunk (simulate hover)
+            details = self.patch_edit.get_chunk_details(chunk_idx)
+            if not details:
+                QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Invalid chunk.")
+                return
+            # Do not auto-switch files; require that the current buffer is the same file
+            if not self._hover_chunk_file:
+                self._hover_chunk_file = details["file_path"].replace("\\", "/")
+            self._hover_chunk_idx = chunk_idx
+            self._hover_context_lines = details["context_lines"]
+            self._evaluate_and_update_ui_for_hovered_chunk()
+
+        self._apply_hovered_chunk_if_possible()
+
+    def _apply_hovered_chunk_if_possible(self):
+        """Apply the currently hovered chunk to the in-memory buffer, if applicable."""
+        if self._hover_chunk_idx is None:
+            return
+
+        details = self.patch_edit.get_chunk_details(self._hover_chunk_idx)
         if not details:
             QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Invalid chunk.")
             return
 
-        file_path = details["file_path"]
-        context_lines = details["context_lines"]
-        n_context = details["n_context"]
-        removed_lines = details["removed_lines"]
-        added_lines = details["added_lines"]
-
-        if not file_path:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Chunk does not contain a file path.")
+        current_path = self.current_view_file()
+        rel = details["file_path"]
+        if not current_path or (details["file_path"].replace("\\", "/") not in str(current_path).replace("\\", "/")):
+            QtWidgets.QMessageBox.information(self, "Apply Chunk", f"Open the target file first: {rel}")
             return
 
-        if self._debug:
-            print(f"[APPLY] Request to apply chunk #{chunk_idx + 1} to {file_path}")
-            print(f"[APPLY] Context lines: {n_context}, removed: {len(removed_lines)}, added: {len(added_lines)}")
+        # Ensure applicability computed
+        lines = self.file_viewer.toPlainText().splitlines()
+        if self._hover_apply_start_idx is None or not self._hover_applicable:
+            # Try to recompute
+            match_line_num = self._find_best_match(lines, details["context_lines"], min_score=60)
+            applicable, already, start_idx, hlen = self._evaluate_chunk_applicability(lines, details, match_line_num)
+            if not applicable or already:
+                reason = "already applied" if already else "context not found"
+                QtWidgets.QMessageBox.information(self, "Apply Chunk", f"Cannot apply: {reason}.")
+                return
+            self._hover_apply_start_idx = start_idx
+            self._hover_highlight_len = hlen
 
-        root_dir = self.root_edit.text().strip()
-        if not root_dir:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Root directory is not set.")
-            return
+        # Apply to in-memory buffer only
+        new_lines = self._apply_at(lines, self._hover_apply_start_idx, details["removed_lines"], details["added_lines"])
+        self.file_viewer.setPlainText("\n".join(new_lines))
+        self.file_viewer.document().setModified(True)
 
-        root = Path(root_dir).expanduser()
-        rel = Path(file_path.replace("\\", "/"))
-        full_path = (root / rel).resolve(strict=False)
-
-        if not full_path.is_file():
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", f"File not found:\n{full_path}")
-            return
-
-        # Read file preserving content to keep trailing newline behavior
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Apply Chunk", f"Failed to read file:\n{full_path}\n\n{e}")
-            return
-
-        ended_with_newline = content.endswith("\n")
-        lines = content.splitlines()  # drop endings; we will reconstruct
-
-        # 1) Locate context via fuzzy match
-        match_line_num = None
-        if context_lines:
-            match_line_num = self._find_best_match(lines, context_lines, min_score=75)
-
-        if match_line_num is None:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Could not confidently locate the context in the target file.")
-            return
-
-        # match_line_num is 1-based for the first context line
-        base_idx = (match_line_num - 1) + n_context  # 0-based index where changes should begin after context block
-
-        # 2) If removals exist, verify or search for them near base_idx
-        start_idx = base_idx
-        if removed_lines:
-            if not self._slice_equals(lines, start_idx, removed_lines):
-                found = self._find_exact_sequence_near(lines, removed_lines, base_idx, window=30)
-                if found is None:
-                    QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Could not find the expected removal block near the matched context.")
-                    return
-                start_idx = found
-
-        # 3) Apply: replace removed block with added block (or pure insertion if no removals)
-        new_lines = self._apply_at(lines, start_idx, removed_lines, added_lines)
-
-        # 4) Write back safely (temp + replace)
-        try:
-            tmp_fd, tmp_path = tempfile.mkstemp(prefix=".iph_", dir=os.path.dirname(str(full_path)))
-            os.close(tmp_fd)
-            with open(tmp_path, "w", encoding="utf-8", errors="replace") as f:
-                out_text = "\n".join(new_lines)
-                # Preserve trailing newline if present before
-                if ended_with_newline and not out_text.endswith("\n"):
-                    out_text += "\n"
-                f.write(out_text)
-            os.replace(tmp_path, str(full_path))
-        except Exception as e:
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
-            QtWidgets.QMessageBox.critical(self, "Apply Chunk", f"Failed to write file:\n{full_path}\n\n{e}")
-            return
-
-        # 5) Refresh right panel if showing this file, re-align and highlight applied region
-        if self.file_viewer.property("current_file") == str(full_path):
-            self.file_viewer.setPlainText("\n".join(new_lines) + ("\n" if ended_with_newline else ""))
-            self.file_viewer.setProperty("current_file", str(full_path))
-
-        applied_start_line = start_idx + 1  # 1-based
+        applied_start_line = self._hover_apply_start_idx + 1
         self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
-        highlight_len = max(1, len(added_lines) if added_lines else (len(removed_lines) if removed_lines else 1))
-        self._highlight_context_in_file_viewer(applied_start_line, highlight_len, color=QtGui.QColor(170, 255, 170, 140))
+        self._highlight_context_in_file_viewer(
+            applied_start_line,
+            max(1, len(details["added_lines"]) or len(details["removed_lines"])),
+            color=QtGui.QColor(170, 255, 170, 140),
+        )
 
-        self.statusBar().showMessage(f"Applied chunk to: {rel.as_posix()}", 4000)
-        if self._debug:
-            print(f"[APPLY] SUCCESS at line {applied_start_line}. Removed {len(removed_lines)} lines, added {len(added_lines)} lines.")
+        self.statusBar().showMessage(f"Applied chunk (in-memory only) to: {Path(current_path).name}", 4000)
 
-    def _find_best_match(self, target_lines: list, query_lines: list, min_score=75) -> int | None:
+        # After applying, the chunk should evaluate as "already applied" for this buffer
+        self._evaluate_and_update_ui_for_hovered_chunk()
+
+    def _find_best_match(self, target_lines: list[str], query_lines: list[str], min_score=75) -> int | None:
         """Finds the best fuzzy match for a block of lines. Returns 1-based starting line number."""
         if not query_lines or not target_lines:
             if self._debug:
@@ -373,9 +437,47 @@ class MainWindow(QtWidgets.QMainWindow):
             if best_score >= min_score:
                 print(f"[FUZZY] SUCCESS: Found match at line {best_line_num} (score >= {min_score})")
             else:
-                print(f"[FUZZY] FAILED: Best score is below threshold of {min_score}")
+                print(f"[FUZZY] FAILED: Best score below threshold of {min_score}")
 
         return best_line_num if best_score >= min_score else None
+
+    def _evaluate_chunk_applicability(self, lines: list[str], details: dict, match_line_num: int | None):
+        """
+        Determine if a chunk can be applied or is already applied against the given lines.
+        Returns (applicable: bool, already_applied: bool, apply_start_idx: int | None, highlight_len: int).
+        """
+        context_lines = details["context_lines"]
+        n_context = details["n_context"]
+        removed = details["removed_lines"]
+        added = details["added_lines"]
+
+        if not context_lines or match_line_num is None:
+            return False, False, None, 0
+
+        base_idx = (match_line_num - 1) + n_context  # where changes should begin after the matched context block
+
+        # Heuristic for "already applied":
+        # - If added lines match at base_idx, and (if removals exist) the removal block cannot be found nearby, consider already applied.
+        if added and self._slice_equals(lines, base_idx, added):
+            if removed:
+                nearby_removed = self._find_exact_sequence_near(lines, removed, base_idx, window=30)
+                if nearby_removed is None:
+                    return False, True, None, len(added)
+            else:
+                return False, True, None, len(added)
+
+        # Check if we can apply:
+        start_idx = base_idx
+        if removed:
+            if not self._slice_equals(lines, start_idx, removed):
+                found = self._find_exact_sequence_near(lines, removed, base_idx, window=30)
+                if found is None:
+                    return False, False, None, 0
+                start_idx = found
+
+        # Applicable (replacement or insertion)
+        highlight_len = max(1, len(added) if added else (len(removed) if removed else 1))
+        return True, False, start_idx, highlight_len
 
     def _scroll_target_line_to_top(self, target_editor: QtWidgets.QPlainTextEdit, target_line_num: int):
         """Scrolls the target editor so that target_line_num is at the top of the viewport."""
@@ -418,7 +520,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cur = QtGui.QTextCursor(doc)
         cur.setPosition(start_block.position())
-        # Span to end of end_block's text
         end_pos = end_block.position() + len(end_block.text())
         cur.setPosition(end_pos, QtGui.QTextCursor.KeepAnchor)
 
@@ -429,7 +530,6 @@ class MainWindow(QtWidgets.QMainWindow):
         sel.format = fmt
         sel.cursor = cur
 
-        # Apply without losing current-line highlight
         self.file_viewer.setExternalSelections([sel])
 
         if self._debug:
@@ -449,6 +549,8 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         n = len(lines)
         m = len(seq)
+        if m == 0:
+            return around
         lo = max(0, around - window)
         hi = min(n - m, around + window)
         for i in range(lo, hi + 1):
