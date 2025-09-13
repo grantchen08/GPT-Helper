@@ -209,6 +209,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._debounce_timer = QtCore.QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(150)
+        self._debounce_timer.timeout.connect(self._reevaluate_hover_state_once)
         self.file_viewer.textChanged.connect(self._on_file_text_changed)
 
         self.load_settings()
@@ -234,19 +235,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _on_file_text_changed(self):
         # Clear transient highlight and re-evaluate applicability after a short debounce
         self.file_viewer.clearExternalSelections()
-        try:
-            self._debounce_timer.timeout.disconnect(self._reevaluate_hover_state_once)
-        except (TypeError, RuntimeError):
-            pass
-        self._debounce_timer.timeout.connect(self._reevaluate_hover_state_once)
+        self._debounce_timer.stop()
         self._debounce_timer.start()
 
     @QtCore.Slot()
     def _reevaluate_hover_state_once(self):
-        try:
-            self._debounce_timer.timeout.disconnect(self._reevaluate_hover_state_once)
-        except (TypeError, RuntimeError):
-            pass
         if self._hover_chunk_idx is None or self._hover_chunk_idx < 0:
             self.apply_btn.setEnabled(False)
             self._clear_diff_preview()
