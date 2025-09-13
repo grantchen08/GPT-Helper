@@ -7,6 +7,7 @@ from chunked_editor import ChunkedPlainTextEdit
 
 # You must run: pip install thefuzz python-Levenshtein
 from thefuzz import fuzz
+import os
 
 # App identity for QSettings
 QtCore.QCoreApplication.setOrganizationName("Grant")
@@ -179,17 +180,25 @@ class MainWindow(QtWidgets.QMainWindow):
         splitter.addWidget(self.file_viewer)
         splitter.setSizes([700, 700])
 
-        # Diff preview dock (optional informational)
-        self.diff_dock = QtWidgets.QDockWidget("Diff Preview", self)
+        # Bottom dock: Root directory tree view (replaces diff preview)
+        self.fs_model = QtWidgets.QFileSystemModel(self)
+        self.fs_model.setRootPath(os.getcwd())
+        # Optional: filter to show files/dirs; adjust as needed
+        self.fs_model.setFilter(QtCore.QDir.AllEntries | QtCore.QDir.NoDotAndDotDot | QtCore.QDir.AllDirs)
+
+        self.dir_tree = QtWidgets.QTreeView(self)
+        self.dir_tree.setModel(self.fs_model)
+        self.dir_tree.setRootIndex(self.fs_model.index(os.getcwd()))
+        self.dir_tree.setSortingEnabled(True)
+        self.dir_tree.sortByColumn(0, QtCore.Qt.AscendingOrder)
+        self.dir_tree.setAlternatingRowColors(True)
+        self.dir_tree.setAnimated(True)
+        self.dir_tree.setHeaderHidden(False)
+
+        self.diff_dock = QtWidgets.QDockWidget("Root Browser", self)
         self.diff_dock.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
-        self.diff_view = QtWidgets.QPlainTextEdit()
-        self.diff_view.setReadOnly(True)
-        self.diff_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
-        self.diff_view.setFont(fixed_font)
-        self.diff_view.setPlaceholderText("Unified diff preview will appear here when a chunk is applicable.")
-        self.diff_dock.setWidget(self.diff_view)
+        self.diff_dock.setWidget(self.dir_tree)
         self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.diff_dock)
-        self.diff_dock.resize(100, 250)
 
         self.statusBar().showMessage("Ready")
 
@@ -527,32 +536,16 @@ class MainWindow(QtWidgets.QMainWindow):
         return True, False, start_idx, highlight_len
 
     def _update_diff_preview(self, details: dict, start_idx: int):
-        """Show unified diff of current buffer vs. hypothetical buffer after applying the hovered chunk."""
-        current_text = self.file_viewer.toPlainText()
-        a_lines = current_text.splitlines()
-        b_lines = self._apply_at(a_lines, start_idx, details["removed_lines"], details["added_lines"])
-
-        current_file = self.current_view_file() or details["file_path"]
-        rel = details["file_path"].replace("\\", "/")
-        a_label = f"a/{Path(current_file).name}" if current_file else f"a/{rel}"
-        b_label = f"b/{Path(current_file).name}" if current_file else f"b/{rel}"
-
-        diff = difflib.unified_diff(
-            a_lines, b_lines,
-            fromfile=a_label, tofile=b_label,
-            lineterm=""
-        )
-        diff_text = "\n".join(diff)
-        if not diff_text.strip():
-            self.diff_view.setPlainText("No changes (chunk would not alter the current buffer).")
-        else:
-            self.diff_view.setPlainText(diff_text)
+        """No-op: diff preview replaced by root directory tree view."""
+        return
 
     def _show_diff_preview_already_applied(self, details: dict):
-        self.diff_view.setPlainText("Chunk appears to be already applied to the current buffer.")
+        """No-op: diff preview replaced by root directory tree view."""
+        return
 
     def _clear_diff_preview(self, show_message: str | None = None):
-        self.diff_view.setPlainText(show_message or "")
+        """No-op: diff preview replaced by root directory tree view."""
+        return
 
     def _scroll_target_line_to_top(self, target_editor: QtWidgets.QPlainTextEdit, target_line_num: int):
         """Scrolls the target editor so that target_line_num is at the top of the viewport."""
@@ -650,6 +643,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if directory:
             self.root_edit.setText(directory)
             self.statusBar().showMessage(f"Root directory set to: {directory}", 3000)
+            # Update tree view root to selected directory
+            if hasattr(self, "fs_model") and hasattr(self, "dir_tree"):
+                self.fs_model.setRootPath(directory)
+                self.dir_tree.setRootIndex(self.fs_model.index(directory))
 
     def relaunch_app(self):
         self.save_settings()
@@ -678,6 +675,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.patch_edit.setPlainText(text)
         debug_on = bool(s.value("app/debug", False, type=bool))
 
+        # Initialize tree view root to saved root directory
+        root_dir = self.root_edit.text()
+        if hasattr(self, "fs_model") and hasattr(self, "dir_tree") and root_dir:
+            self.fs_model.setRootPath(root_dir)
+            self.dir_tree.setRootIndex(self.fs_model.index(root_dir))
         # Avoid triggering toggled during load; then apply explicitly
         self.debug_check.blockSignals(True)
         self.debug_check.setChecked(debug_on)
