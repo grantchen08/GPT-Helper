@@ -1,5 +1,4 @@
 import re
-from collections import deque
 from PySide6 import QtWidgets, QtCore, QtGui
 
 
@@ -15,11 +14,13 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
       - Assigns a chunk index to every block in a chunk (block.userState = chunk_idx, 0-based).
       - On hover: shows "Chunk #n", highlights the chunk, and emits a `chunkHovered` signal
         with the chunk's file path and its context lines for fuzzy matching.
+      - Context menu: "Apply Chunk #n" emits chunkApplyRequested.
+      - get_chunk_details(idx): returns details needed to apply a chunk.
     """
     chunks_recomputed = QtCore.Signal(int)
     # Emits (chunk_index, file_path, list_of_context_lines, first_context_block)
     chunkHovered = QtCore.Signal(int, str, list, QtGui.QTextBlock)
-    # NEW: Emitted when the user chooses "Apply" via context menu on a chunk
+    # Emitted when the user chooses "Apply" via context menu on a chunk
     chunkApplyRequested = QtCore.Signal(int)
 
     def __init__(self, parent=None, context_before=3, debug=False):
@@ -32,10 +33,10 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._debug = bool(debug)
 
         self._chunk_count = 0
-        self._chunk_block_spans = []
-        self._chunk_pos_spans = []
-        self._chunk_file_paths = []
-        self._chunk_context_info = []  # list of (context_lines, first_context_block)
+        self._chunk_block_spans = []   # list[(bn_start, bn_end)]
+        self._chunk_pos_spans = []     # list[(start_pos, end_pos_excl)]
+        self._chunk_file_paths = []    # per-chunk file path
+        self._chunk_context_info = []  # list[(context_lines, first_context_block)]
         self._last_hover_chunk = None
 
         self._fmt_chunk_green = self._make_bg_format(QtGui.QColor(128, 255, 170, 140))
@@ -260,3 +261,43 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
 
     def chunk_count(self) -> int:
         return self._chunk_count
+
+    # NEW: Provide structured details for applying a chunk
+    def get_chunk_details(self, chunk_idx: int):
+        """
+        Returns a dict with:
+          file_path: str
+          context_lines: list[str]
+          n_context: int
+          removed_lines: list[str]  # '-' lines without leading '-'
+          added_lines: list[str]    # '+' lines without leading '+'
+        """
+        if chunk_idx < 0 or chunk_idx >= len(self._chunk_block_spans):
+            return None
+
+        file_path = self._chunk_file_paths[chunk_idx]
+        context_lines, _first_ctx_block = self._chunk_context_info[chunk_idx]
+
+        bn_start, bn_end = self._chunk_block_spans[chunk_idx]
+        start_block = self.document().findBlockByNumber(bn_start)
+        end_block = self.document().findBlockByNumber(bn_end)
+
+        removed_lines = []
+        added_lines = []
+
+        b = start_block
+        while b.isValid() and b.blockNumber() <= bn_end:
+            t = b.text()
+            if self._is_del(t):
+                removed_lines.append(t[1:])
+            elif self._is_add(t):
+                added_lines.append(t[1:])
+            b = b.next()
+
+        return {
+            "file_path": file_path,
+            "context_lines": list(context_lines),
+            "n_context": len(context_lines),
+            "removed_lines": removed_lines,
+            "added_lines": added_lines,
+        }
