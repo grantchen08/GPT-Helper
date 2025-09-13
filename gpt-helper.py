@@ -1,6 +1,7 @@
 import sys
 import os
 import tempfile
+from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 from chunked_editor import ChunkedPlainTextEdit
 
@@ -34,7 +35,7 @@ class CodeEditor(QtWidgets.QPlainTextEdit):
         super().__init__(parent)
         self.lineNumberArea = LineNumberArea(self)
 
-        # Holds external selections (e.g., highlight for matched context in the right pane)
+        # Holds external selections (e.g., highlight for matched/applied region)
         self._externalSelections: list[QtWidgets.QTextEdit.ExtraSelection] = []
 
         self.blockCountChanged.connect(self.updateLineNumberAreaWidth)
@@ -90,7 +91,7 @@ class CodeEditor(QtWidgets.QPlainTextEdit):
             selection.cursor.clearSelection()
             extraSelections.append(selection)
 
-        # Merge with external selections (e.g., matched context highlight)
+        # Merge with external selections (e.g., matched/applied region)
         if self._externalSelections:
             extraSelections.extend(self._externalSelections)
 
@@ -154,10 +155,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # Left: Patch editor
         self.patch_edit = ChunkedPlainTextEdit(context_before=3, debug=False)
         self.patch_edit.setPlaceholderText("Paste patch text here…")
-        # Recommended: no wrapping for more stable geometry
+        # For stable geometry
         self.patch_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.patch_edit.chunkHovered.connect(self._on_chunk_hovered)
-        # Connect Apply action from context menu
+        # Context menu "Apply Chunk" handler
         self.patch_edit.chunkApplyRequested.connect(self._on_chunk_apply_requested)
 
         # Right: File viewer
@@ -166,7 +167,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_viewer.setPlaceholderText("Hover over a chunk on the left to see the corresponding file here.")
         fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         self.file_viewer.setFont(fixed_font)
-        # Recommended: no wrapping for stable geometry
+        # For stable geometry
         self.file_viewer.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
 
         splitter.addWidget(self.patch_edit)
@@ -175,8 +176,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage("Ready")
 
-        # Debug flag
-        self._debug = True  # or self.debug_check.isChecked()
+        # Debug flag (toggle with checkbox if you prefer)
+        self._debug = True
 
         self.load_settings()
 
@@ -202,28 +203,31 @@ class MainWindow(QtWidgets.QMainWindow):
             self.file_viewer.clearExternalSelections()
             return
 
-        full_path = os.path.join(root_dir, file_path)
+        # Normalize build path
+        root = Path(root_dir).expanduser()
+        rel = Path(file_path.replace("\\", "/"))
+        full_path = (root / rel).resolve(strict=False)
+
         current_path = self.file_viewer.property("current_file")
-        if current_path != full_path:
+        if current_path != str(full_path):
             try:
-                if os.path.isfile(full_path):
-                    # Read entire text to preserve end-of-line style info
+                if full_path.is_file():
                     with open(full_path, 'r', encoding='utf-8', errors='replace') as f:
                         content = f.read()
                     self.file_viewer.setPlainText(content)
-                    self.file_viewer.setProperty("current_file", full_path)
-                    self.statusBar().showMessage(f"Showing: {file_path}", 4000)
+                    self.file_viewer.setProperty("current_file", str(full_path))
+                    self.statusBar().showMessage(f"Showing: {rel.as_posix()}", 4000)
                 else:
                     self.file_viewer.setPlainText(f"File not found: {full_path}")
                     self.file_viewer.setProperty("current_file", None)
                     self.file_viewer.clearExternalSelections()
-                    self.statusBar().showMessage(f"File not found: {file_path}", 4000)
+                    self.statusBar().showMessage(f"File not found: {rel.as_posix()}", 4000)
                     return
             except Exception as e:
                 self.file_viewer.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
                 self.file_viewer.setProperty("current_file", None)
                 self.file_viewer.clearExternalSelections()
-                self.statusBar().showMessage(f"Error reading {file_path}", 4000)
+                self.statusBar().showMessage(f"Error reading {rel.as_posix()}", 4000)
                 return
 
         # With content loaded, try to find and align/highlight the matching context
@@ -234,12 +238,116 @@ class MainWindow(QtWidgets.QMainWindow):
             if match_line_num is not None:
                 # Align: top-align the first matched line (simple and robust)
                 self._scroll_target_line_to_top(self.file_viewer, match_line_num)
-
                 # Highlight exactly the matched context block
                 self._highlight_context_in_file_viewer(match_line_num, len(context_lines))
             else:
                 # No match => clear highlight
                 self.file_viewer.clearExternalSelections()
+
+    @QtCore.Slot(int)
+    def _on_chunk_apply_requested(self, chunk_idx: int):
+        """Apply the chosen chunk: locate context, remove '-' lines, insert '+' lines, and write the file."""
+        details = self.patch_edit.get_chunk_details(chunk_idx)
+        if not details:
+            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Invalid chunk.")
+            return
+
+        file_path = details["file_path"]
+        context_lines = details["context_lines"]
+        n_context = details["n_context"]
+        removed_lines = details["removed_lines"]
+        added_lines = details["added_lines"]
+
+        if not file_path:
+            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Chunk does not contain a file path.")
+            return
+
+        if self._debug:
+            print(f"[APPLY] Request to apply chunk #{chunk_idx + 1} to {file_path}")
+            print(f"[APPLY] Context lines: {n_context}, removed: {len(removed_lines)}, added: {len(added_lines)}")
+
+        root_dir = self.root_edit.text().strip()
+        if not root_dir:
+            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Root directory is not set.")
+            return
+
+        root = Path(root_dir).expanduser()
+        rel = Path(file_path.replace("\\", "/"))
+        full_path = (root / rel).resolve(strict=False)
+
+        if not full_path.is_file():
+            QtWidgets.QMessageBox.warning(self, "Apply Chunk", f"File not found:\n{full_path}")
+            return
+
+        # Read file preserving content to keep trailing newline behavior
+        try:
+            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Apply Chunk", f"Failed to read file:\n{full_path}\n\n{e}")
+            return
+
+        ended_with_newline = content.endswith("\n")
+        lines = content.splitlines()  # drop endings; we will reconstruct
+
+        # 1) Locate context via fuzzy match
+        match_line_num = None
+        if context_lines:
+            match_line_num = self._find_best_match(lines, context_lines, min_score=75)
+
+        if match_line_num is None:
+            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Could not confidently locate the context in the target file.")
+            return
+
+        # match_line_num is 1-based for the first context line
+        base_idx = (match_line_num - 1) + n_context  # 0-based index where changes should begin after context block
+
+        # 2) If removals exist, verify or search for them near base_idx
+        start_idx = base_idx
+        if removed_lines:
+            if not self._slice_equals(lines, start_idx, removed_lines):
+                found = self._find_exact_sequence_near(lines, removed_lines, base_idx, window=30)
+                if found is None:
+                    QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Could not find the expected removal block near the matched context.")
+                    return
+                start_idx = found
+
+        # 3) Apply: replace removed block with added block (or pure insertion if no removals)
+        new_lines = self._apply_at(lines, start_idx, removed_lines, added_lines)
+
+        # 4) Write back safely (temp + replace)
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(prefix=".iph_", dir=os.path.dirname(str(full_path)))
+            os.close(tmp_fd)
+            with open(tmp_path, "w", encoding="utf-8", errors="replace") as f:
+                out_text = "\n".join(new_lines)
+                # Preserve trailing newline if present before
+                if ended_with_newline and not out_text.endswith("\n"):
+                    out_text += "\n"
+                f.write(out_text)
+            os.replace(tmp_path, str(full_path))
+        except Exception as e:
+            try:
+                if os.path.exists(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+            QtWidgets.QMessageBox.critical(self, "Apply Chunk", f"Failed to write file:\n{full_path}\n\n{e}")
+            return
+
+        # 5) Refresh right panel if showing this file, re-align and highlight applied region
+        if self.file_viewer.property("current_file") == str(full_path):
+            self.file_viewer.setPlainText("\n".join(new_lines) + ("\n" if ended_with_newline else ""))
+            self.file_viewer.setProperty("current_file", str(full_path))
+
+        applied_start_line = start_idx + 1  # 1-based
+        self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
+        highlight_len = max(1, len(added_lines) if added_lines else (len(removed_lines) if removed_lines else 1))
+        self._highlight_context_in_file_viewer(applied_start_line, highlight_len, color=QtGui.QColor(170, 255, 170, 140))
+
+        self.statusBar().showMessage(f"Applied chunk to: {rel.as_posix()}", 4000)
+        if self._debug:
+            print(f"[APPLY] SUCCESS at line {applied_start_line}. Removed {len(removed_lines)} lines, added {len(added_lines)} lines.")
 
     def _find_best_match(self, target_lines: list, query_lines: list, min_score=75) -> int | None:
         """Finds the best fuzzy match for a block of lines. Returns 1-based starting line number."""
@@ -326,113 +434,6 @@ class MainWindow(QtWidgets.QMainWindow):
 
         if self._debug:
             print(f"[HILITE] Highlighting lines {start_idx + 1}..{end_idx + 1}")
-
-    @QtCore.Slot(int)
-    def _on_chunk_apply_requested(self, chunk_idx: int):
-        """Apply the chosen chunk: locate context, remove '-' lines, insert '+' lines, and write the file."""
-        details = self.patch_edit.get_chunk_details(chunk_idx)
-        if not details:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Invalid chunk.")
-            return
-
-        file_path = details["file_path"]
-        context_lines = details["context_lines"]
-        n_context = details["n_context"]
-        removed_lines = details["removed_lines"]
-        added_lines = details["added_lines"]
-
-        if self._debug:
-            print(f"[APPLY] Request to apply chunk #{chunk_idx + 1} to {file_path}")
-            print(f"[APPLY] Context lines: {n_context}, removed: {len(removed_lines)}, added: {len(added_lines)}")
-
-        if not file_path:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Chunk does not contain a file path.")
-            return
-
-        root_dir = self.root_edit.text().strip()
-        if not root_dir:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Root directory is not set.")
-            return
-
-        full_path = os.path.join(root_dir, file_path)
-        if not os.path.isfile(full_path):
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", f"File not found:\n{full_path}")
-            return
-
-        # Read file preserving content so we can keep trailing newline behavior
-        try:
-            with open(full_path, "r", encoding="utf-8", errors="replace") as f:
-                content = f.read()
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Apply Chunk", f"Failed to read file:\n{full_path}\n\n{e}")
-            return
-
-        ended_with_newline = content.endswith("\n")
-        lines = content.splitlines()  # drop line endings; we will reconstruct
-
-        # 1) Locate context via fuzzy match
-        match_line_num = None
-        if context_lines:
-            match_line_num = self._find_best_match(lines, context_lines, min_score=75)
-
-        if match_line_num is None:
-            QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Could not confidently locate the context in the target file.")
-            return
-
-        # match_line_num is 1-based for the first context line
-        base_idx = (match_line_num - 1) + n_context  # 0-based index where changes should begin after context block
-
-        # 2) If removals exist, verify or search for them near base_idx
-        start_idx = base_idx
-        if removed_lines:
-            # First, try exact at base
-            if not self._slice_equals(lines, start_idx, removed_lines):
-                # Search a small window around base for robustness
-                found = self._find_exact_sequence_near(lines, removed_lines, base_idx, window=30)
-                if found is None:
-                    QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Could not find the expected removal block near the matched context.")
-                    return
-                start_idx = found
-
-        # 3) Apply: replace removed block with added block (or pure insert if no removals)
-        new_lines = self._apply_at(lines, start_idx, removed_lines, added_lines)
-
-        # 4) Write back safely (temp + replace)
-        try:
-            tmp_fd, tmp_path = tempfile.mkstemp(prefix=".iph_", dir=os.path.dirname(full_path))
-            os.close(tmp_fd)
-            with open(tmp_path, "w", encoding="utf-8", errors="replace") as f:
-                out_text = "\n".join(new_lines)
-                if ended_with_newline or (lines and lines[-1] == ""):
-                    # Preserve trailing newline if present before
-                    if not out_text.endswith("\n"):
-                        out_text += "\n"
-                f.write(out_text)
-            os.replace(tmp_path, full_path)
-        except Exception as e:
-            # Clean up tmp if present
-            try:
-                if os.path.exists(tmp_path):
-                    os.remove(tmp_path)
-            except Exception:
-                pass
-            QtWidgets.QMessageBox.critical(self, "Apply Chunk", f"Failed to write file:\n{full_path}\n\n{e}")
-            return
-
-        # 5) Refresh right panel if showing this file, re-align and highlight applied region
-        if self.file_viewer.property("current_file") == full_path:
-            self.file_viewer.setPlainText("\n".join(new_lines) + ("\n" if ended_with_newline else ""))
-            self.file_viewer.setProperty("current_file", full_path)
-
-        # Align view to the start of applied region and highlight the added block
-        applied_start_line = start_idx + 1  # 1-based
-        self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
-        highlight_len = max(1, len(added_lines) if added_lines else (len(removed_lines) if removed_lines else 1))
-        self._highlight_context_in_file_viewer(applied_start_line, highlight_len, color=QtGui.QColor(170, 255, 170, 140))
-
-        self.statusBar().showMessage(f"Applied chunk to: {file_path}", 4000)
-        if self._debug:
-            print(f"[APPLY] SUCCESS at line {applied_start_line}. Removed {len(removed_lines)} lines, added {len(added_lines)} lines.")
 
     @staticmethod
     def _slice_equals(haystack: list[str], start: int, needle: list[str]) -> bool:

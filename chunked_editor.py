@@ -65,11 +65,20 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
 
     @staticmethod
     def _parse_filepath_from_header(text: str) -> str:
+        # Some tools can append extra tokens after the path (tabs, annotations).
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
             return ""
-        path_part = parts[1]
-        return path_part[2:] if path_part.startswith('b/') else path_part
+        path_part = parts[1].strip()
+        # Keep only the first "token" if extras are present after whitespace or tabs.
+        path_part = path_part.split()[0]
+        # Strip diff prefixes a/ or b/
+        if path_part.startswith('a/') or path_part.startswith('b/'):
+            path_part = path_part[2:]
+        # Normalize separators (we prefer forward slashes; we'll join with pathlib later)
+        path_part = path_part.replace('\\', '/')
+        # Final trim (in case of stray CR)
+        return path_part.strip()
 
     @staticmethod
     def _is_hunk_header(text: str) -> bool:
