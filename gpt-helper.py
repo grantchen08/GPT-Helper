@@ -1,5 +1,6 @@
 import sys
 import os
+import difflib
 from pathlib import Path
 from PySide6 import QtWidgets, QtCore, QtGui
 from chunked_editor import ChunkedPlainTextEdit
@@ -12,8 +13,6 @@ QtCore.QCoreApplication.setOrganizationName("Grant")
 QtCore.QCoreApplication.setOrganizationDomain("grantech.co")
 QtCore.QCoreApplication.setApplicationName("InteractivePatchHelper")
 
-
-# --- Helper classes for the line number feature ---
 
 class LineNumberArea(QtWidgets.QWidget):
     """A widget that draws line numbers for a QPlainTextEdit."""
@@ -124,7 +123,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Interactive Patch Helper")
-        self.resize(1200, 800)
+        self.resize(1400, 900)
 
         central = QtWidgets.QWidget()
         layout = QtWidgets.QVBoxLayout(central)
@@ -138,7 +137,8 @@ class MainWindow(QtWidgets.QMainWindow):
         choose_btn = QtWidgets.QPushButton("Choose Root…")
         choose_btn.clicked.connect(self.choose_root)
         self.debug_check = QtWidgets.QCheckBox("Debug logs")
-        self.debug_check.stateChanged.connect(self._on_debug_toggled)
+        # Use toggled(bool) to avoid int/enum comparison issues
+        self.debug_check.toggled.connect(self._on_debug_toggled)
         self.relaunch_btn = QtWidgets.QPushButton("Relaunch")
         self.relaunch_btn.clicked.connect(self.relaunch_app)
         # Apply button for hovered chunk (enabled/disabled dynamically)
@@ -160,27 +160,41 @@ class MainWindow(QtWidgets.QMainWindow):
         # Left: Patch editor
         self.patch_edit = ChunkedPlainTextEdit(context_before=3, debug=False)
         self.patch_edit.setPlaceholderText("Paste patch text here…")
+        # For stable geometry
         self.patch_edit.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
         self.patch_edit.chunkHovered.connect(self._on_chunk_hovered)
+        # Context menu "Apply Chunk" handler
         self.patch_edit.chunkApplyRequested.connect(self._on_chunk_apply_requested)
 
-        # Right: File viewer (single source of truth for current file buffer)
+        # Right: File viewer (in-memory single source of truth)
         self.file_viewer = CodeEditor()
-        # Allow direct editing by default (in-memory only)
         self.file_viewer.setReadOnly(False)
         self.file_viewer.setPlaceholderText("Hover a chunk on the left; the file will load here if the view is empty.")
         fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
         self.file_viewer.setFont(fixed_font)
+        # For stable geometry
         self.file_viewer.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
 
         splitter.addWidget(self.patch_edit)
         splitter.addWidget(self.file_viewer)
-        splitter.setSizes([600, 600])
+        splitter.setSizes([700, 700])
+
+        # Diff preview dock (optional informational)
+        self.diff_dock = QtWidgets.QDockWidget("Diff Preview", self)
+        self.diff_dock.setAllowedAreas(QtCore.Qt.BottomDockWidgetArea | QtCore.Qt.RightDockWidgetArea)
+        self.diff_view = QtWidgets.QPlainTextEdit()
+        self.diff_view.setReadOnly(True)
+        self.diff_view.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        self.diff_view.setFont(fixed_font)
+        self.diff_view.setPlaceholderText("Unified diff preview will appear here when a chunk is applicable.")
+        self.diff_dock.setWidget(self.diff_view)
+        self.addDockWidget(QtCore.Qt.BottomDockWidgetArea, self.diff_dock)
+        self.diff_dock.resize(100, 250)
 
         self.statusBar().showMessage("Ready")
 
         # Debug flag
-        self._debug = True
+        self._debug = False
 
         # Track current hovered chunk info
         self._hover_chunk_idx: int | None = None
@@ -206,24 +220,42 @@ class MainWindow(QtWidgets.QMainWindow):
     def is_view_empty(self) -> bool:
         return (self.file_viewer.toPlainText() == "") and (self.current_view_file() is None)
 
+    @QtCore.Slot(bool)
+    def _on_debug_toggled(self, on: bool):
+        self._apply_debug_state(on)
+
+    def _apply_debug_state(self, on: bool):
+        self._debug = on
+        self.patch_edit.set_debug(on)  # pass to child widget for its own logs
+        self.statusBar().showMessage("Debug logging " + ("enabled" if on else "disabled"), 2000)
+        print("\n--- Debug logging " + ("enabled" if on else "disabled") + " ---")
+
     @QtCore.Slot()
     def _on_file_text_changed(self):
         # Clear transient highlight and re-evaluate applicability after a short debounce
         self.file_viewer.clearExternalSelections()
+        try:
+            self._debounce_timer.timeout.disconnect(self._reevaluate_hover_state_once)
+        except (TypeError, RuntimeError):
+            pass
         self._debounce_timer.timeout.connect(self._reevaluate_hover_state_once)
         self._debounce_timer.start()
 
     @QtCore.Slot()
     def _reevaluate_hover_state_once(self):
-        self._debounce_timer.timeout.disconnect(self._reevaluate_hover_state_once)
+        try:
+            self._debounce_timer.timeout.disconnect(self._reevaluate_hover_state_once)
+        except (TypeError, RuntimeError):
+            pass
         if self._hover_chunk_idx is None or self._hover_chunk_idx < 0:
             self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
             return
         # Re-run applicability based on current buffer
         self._evaluate_and_update_ui_for_hovered_chunk()
 
     @QtCore.Slot(int, str, list, QtGui.QTextBlock)
-    def _on_chunk_hovered(self, chunk_idx: int, file_path: str, context_lines: list, first_context_block: QtGui.QTextBlock):
+    def _on_chunk_hovered(self, chunk_idx: int, file_path: str, context_lines: list, _first_context_block: QtGui.QTextBlock):
         """
         Loads file only if the right panel is empty; otherwise reuses current buffer.
         Computes applicability of hovered chunk against the current buffer and updates apply button and highlight.
@@ -239,6 +271,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._hover_highlight_len = 0
             self.file_viewer.clearExternalSelections()
             self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
             return
 
         # Update hover context
@@ -259,6 +292,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not root_dir:
             self.statusBar().showMessage("Root directory not set.", 3000)
             self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
             return
 
         root = Path(root_dir).expanduser()
@@ -293,6 +327,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 )
                 self.apply_btn.setEnabled(False)
                 self.file_viewer.clearExternalSelections()
+                self._clear_diff_preview()
                 return
 
         # Evaluate applicability and update highlight/UI
@@ -302,18 +337,21 @@ class MainWindow(QtWidgets.QMainWindow):
         """Evaluate applicability of the currently hovered chunk against the current buffer. Update UI accordingly."""
         if self._hover_chunk_idx is None or not self._hover_chunk_file:
             self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
             return
 
         # Extract details for hovered chunk
         details = self.patch_edit.get_chunk_details(self._hover_chunk_idx)
         if not details:
             self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
             return
 
         # Ensure file path matches the loaded buffer (we already constrained on hover, but double-check)
         current_path = self.current_view_file()
-        if not current_path or (self._hover_chunk_file not in str(current_path).replace("\\", "/")):
+        if not current_path or (details["file_path"].replace("\\", "/") not in str(current_path).replace("\\", "/")):
             self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
             return
 
         # Compute match and applicability on current buffer
@@ -328,36 +366,53 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hover_apply_start_idx = apply_start_idx
         self._hover_highlight_len = highlight_len
 
-        # Scroll and highlight if we have a context match
-        if match_line_num is not None:
+        # Prefer highlighting the matched context if available and non-empty
+        n_ctx = details.get("n_context", 0)
+        if match_line_num is not None and n_ctx > 0:
             self._scroll_target_line_to_top(self.file_viewer, match_line_num)
             # Highlight context (blue) or applied region will be highlighted when applied
-            self._highlight_context_in_file_viewer(match_line_num, details["n_context"])
+            self._highlight_context_in_file_viewer(match_line_num, n_ctx)
+        # If there are no context lines in this chunk, fall back to previewing the edit region
+        elif self._hover_apply_start_idx is not None and self._hover_highlight_len > 0:
+            applied_start_line = self._hover_apply_start_idx + 1  # 1-based
+            self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
+            self._highlight_context_in_file_viewer(applied_start_line, self._hover_highlight_len)
         else:
-            self.file_viewer.clearExternalSelections()
+            # Try a simple exact search on the first non-empty context line as a fallback
+            first_ctx_line = next((l for l in details["context_lines"] if l.strip()), None)
+            if first_ctx_line:
+                try:
+                    pos = lines.index(first_ctx_line)
+                    self._scroll_target_line_to_top(self.file_viewer, pos + 1)
+                    self._highlight_context_in_file_viewer(pos + 1, 1)
+                except ValueError:
+                    self.file_viewer.clearExternalSelections()
+            else:
+                self.file_viewer.clearExternalSelections()
 
-        # Update Apply button state
+        # Update Apply button state and diff preview
         if already_applied:
             self.apply_btn.setEnabled(False)
             self.apply_btn.setToolTip("Chunk already applied to current buffer.")
-        elif applicable:
+            self._show_diff_preview_already_applied(details)
+        elif applicable and apply_start_idx is not None:
             self.apply_btn.setEnabled(True)
             self.apply_btn.setToolTip("Apply this chunk to the current buffer.")
+            self._update_diff_preview(details, apply_start_idx)
         else:
             self.apply_btn.setEnabled(False)
             self.apply_btn.setToolTip("Context not found or ambiguous in current buffer.")
+            self._clear_diff_preview(show_message="Context not found or ambiguous.")
 
     @QtCore.Slot(int)
     def _on_chunk_apply_requested(self, chunk_idx: int):
-        """Apply from the left context menu; internally this delegates to the same logic as the top button."""
-        # Only apply if this is the currently hovered chunk
+        """Apply from the left context menu; internally delegates to the same logic as the top button."""
+        # If user clicked a different chunk, simulate hover for it first
         if self._hover_chunk_idx != chunk_idx:
-            # Recompute hover info for this chunk (simulate hover)
             details = self.patch_edit.get_chunk_details(chunk_idx)
             if not details:
                 QtWidgets.QMessageBox.warning(self, "Apply Chunk", "Invalid chunk.")
                 return
-            # Do not auto-switch files; require that the current buffer is the same file
             if not self._hover_chunk_file:
                 self._hover_chunk_file = details["file_path"].replace("\\", "/")
             self._hover_chunk_idx = chunk_idx
@@ -385,7 +440,6 @@ class MainWindow(QtWidgets.QMainWindow):
         # Ensure applicability computed
         lines = self.file_viewer.toPlainText().splitlines()
         if self._hover_apply_start_idx is None or not self._hover_applicable:
-            # Try to recompute
             match_line_num = self._find_best_match(lines, details["context_lines"], min_score=60)
             applicable, already, start_idx, hlen = self._evaluate_chunk_applicability(lines, details, match_line_num)
             if not applicable or already:
@@ -400,7 +454,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.file_viewer.setPlainText("\n".join(new_lines))
         self.file_viewer.document().setModified(True)
 
-        applied_start_line = self._hover_apply_start_idx + 1
+        applied_start_line = self._hover_apply_start_idx + 1  # 1-based
         self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
         self._highlight_context_in_file_viewer(
             applied_start_line,
@@ -410,7 +464,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.statusBar().showMessage(f"Applied chunk (in-memory only) to: {Path(current_path).name}", 4000)
 
-        # After applying, the chunk should evaluate as "already applied" for this buffer
+        # After applying, re-evaluate so next hover highlights correctly
         self._evaluate_and_update_ui_for_hovered_chunk()
 
     def _find_best_match(self, target_lines: list[str], query_lines: list[str], min_score=75) -> int | None:
@@ -479,6 +533,34 @@ class MainWindow(QtWidgets.QMainWindow):
         highlight_len = max(1, len(added) if added else (len(removed) if removed else 1))
         return True, False, start_idx, highlight_len
 
+    def _update_diff_preview(self, details: dict, start_idx: int):
+        """Show unified diff of current buffer vs. hypothetical buffer after applying the hovered chunk."""
+        current_text = self.file_viewer.toPlainText()
+        a_lines = current_text.splitlines()
+        b_lines = self._apply_at(a_lines, start_idx, details["removed_lines"], details["added_lines"])
+
+        current_file = self.current_view_file() or details["file_path"]
+        rel = details["file_path"].replace("\\", "/")
+        a_label = f"a/{Path(current_file).name}" if current_file else f"a/{rel}"
+        b_label = f"b/{Path(current_file).name}" if current_file else f"b/{rel}"
+
+        diff = difflib.unified_diff(
+            a_lines, b_lines,
+            fromfile=a_label, tofile=b_label,
+            lineterm=""
+        )
+        diff_text = "\n".join(diff)
+        if not diff_text.strip():
+            self.diff_view.setPlainText("No changes (chunk would not alter the current buffer).")
+        else:
+            self.diff_view.setPlainText(diff_text)
+
+    def _show_diff_preview_already_applied(self, details: dict):
+        self.diff_view.setPlainText("Chunk appears to be already applied to the current buffer.")
+
+    def _clear_diff_preview(self, show_message: str | None = None):
+        self.diff_view.setPlainText(show_message or "")
+
     def _scroll_target_line_to_top(self, target_editor: QtWidgets.QPlainTextEdit, target_line_num: int):
         """Scrolls the target editor so that target_line_num is at the top of the viewport."""
         target_block = target_editor.document().findBlockByNumber(target_line_num - 1)
@@ -520,6 +602,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         cur = QtGui.QTextCursor(doc)
         cur.setPosition(start_block.position())
+        # Span to end of end_block's text
         end_pos = end_block.position() + len(end_block.text())
         cur.setPosition(end_pos, QtGui.QTextCursor.KeepAnchor)
 
@@ -530,6 +613,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sel.format = fmt
         sel.cursor = cur
 
+        # Apply without losing current-line highlight
         self.file_viewer.setExternalSelections([sel])
 
         if self._debug:
@@ -574,16 +658,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.root_edit.setText(directory)
             self.statusBar().showMessage(f"Root directory set to: {directory}", 3000)
 
-    def _on_debug_toggled(self, state: int):
-        on = (state == QtCore.Qt.Checked)
-        self._debug = on
-        self.patch_edit.set_debug(on)  # pass to child widget for its own logs
-        self.statusBar().showMessage("Debug logging " + ("enabled" if on else "disabled"), 2000)
-        if on:
-            print("\n--- Debug logging enabled ---")
-        else:
-            print("\n--- Debug logging disabled ---")
-
     def relaunch_app(self):
         self.save_settings()
         if getattr(sys, "frozen", False):
@@ -609,8 +683,13 @@ class MainWindow(QtWidgets.QMainWindow):
         text = s.value("app/patchText", "", type=str)
         if text:
             self.patch_edit.setPlainText(text)
-        debug_on = s.value("app/debug", False, type=bool)
+        debug_on = bool(s.value("app/debug", False, type=bool))
+
+        # Avoid triggering toggled during load; then apply explicitly
+        self.debug_check.blockSignals(True)
         self.debug_check.setChecked(debug_on)
+        self.debug_check.blockSignals(False)
+        self._apply_debug_state(debug_on)
 
     def save_settings(self):
         s = QtCore.QSettings()
