@@ -5,9 +5,10 @@ from PySide6 import QtWidgets, QtCore, QtGui
 class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
     """
     Chunk definition (unified diff semantics):
-      - Each chunk is a run of contiguous '+' lines (additions).
-      - If that '+' run is immediately preceded by a contiguous run of '-' lines (removals),
-        those '-' lines are included in the same chunk.
+      - Each chunk is either:
+          - a run of contiguous '+' lines (additions), optionally immediately preceded by a contiguous run
+            of '-' lines (removals), or
+          - a run of contiguous '-' lines on their own (pure deletions).
       - Include up to N (1..3) preceding non-blank context lines.
 
     Behavior:
@@ -188,8 +189,33 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
                     b = curp
                     continue
                 else:
-                    b = (minus_end.next() if minus_end is not None else b.next())
-                    continue
+                    # No '+' run follows. If we had a '-' run, treat it as a pure deletion chunk.
+                    if minus_start is not None and minus_end is not None:
+                        first_data_block = minus_start
+                        context_blocks = self._collect_preceding_context_blocks(first_data_block, self._context_before)
+                        chunk_start_block = context_blocks[0] if context_blocks else first_data_block
+                        chunk_end_block = minus_end
+
+                        self._chunk_block_spans.append((chunk_start_block.blockNumber(), chunk_end_block.blockNumber()))
+                        self._chunk_file_paths.append(current_filepath)
+
+                        # Collect context lines and the first context block for this chunk
+                        chunk_context_lines = []
+                        first_context_block = None
+                        iter_block = chunk_start_block
+                        while iter_block.isValid() and iter_block.blockNumber() <= chunk_end_block.blockNumber():
+                            if self._is_ctx(iter_block.text()):
+                                chunk_context_lines.append(iter_block.text()[1:])
+                                if first_context_block is None:
+                                    first_context_block = iter_block
+                            iter_block = iter_block.next()
+                        self._chunk_context_info.append((chunk_context_lines, first_context_block))
+
+                        b = minus_end.next()
+                        continue
+                    else:
+                        b = b.next()
+                        continue
 
             b = b.next()
 
