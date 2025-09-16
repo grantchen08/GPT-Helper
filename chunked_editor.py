@@ -290,9 +290,16 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
 
         menu = QtWidgets.QMenu(self)
         act_apply = menu.addAction(f"Apply Chunk #{idx + 1}")
+        act_copy = menu.addAction("Copy")
         chosen = menu.exec(event.globalPos())
         if chosen == act_apply:
             self.chunkApplyRequested.emit(idx)
+        elif chosen == act_copy:
+            details = self.get_chunk_details(idx)
+            if details:
+                # Copy only the '+' lines of the chunk, without the leading '+'
+                added_lines = details.get("added_lines", [])
+                QtWidgets.QApplication.clipboard().setText("\n".join(added_lines))
 
     def chunk_count(self) -> int:
         return self._chunk_count
