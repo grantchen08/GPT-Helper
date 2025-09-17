@@ -274,7 +274,11 @@ class MainWindow(QtWidgets.QMainWindow):
             self.file_viewer.clearExternalSelections()
             self.apply_btn.setEnabled(False)
             self._clear_diff_preview()
+            # Do not clear previously known statuses; they remain until content changes
             return
+
+        # Clear any previous status for different files if needed is intentionally skipped,
+        # as statuses are per-chunk and persist to indicate applicability/already-applied info.
 
         # Update hover context
         self._hover_chunk_idx = chunk_idx
@@ -368,6 +372,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hover_apply_start_idx = apply_start_idx
         self._hover_highlight_len = highlight_len
 
+        # Update left-pane chunk color based on applicability
+        if self._hover_chunk_idx is not None and self._hover_chunk_idx >= 0:
+            if already_applied:
+                self.patch_edit.set_chunk_status(
+                    self._hover_chunk_idx, ChunkedPlainTextEdit.STATUS_ALREADY
+                )
+            elif applicable:
+                self.patch_edit.set_chunk_status(
+                    self._hover_chunk_idx, ChunkedPlainTextEdit.STATUS_APPLICABLE
+                )
+            else:
+                self.patch_edit.set_chunk_status(
+                    self._hover_chunk_idx, ChunkedPlainTextEdit.STATUS_NOT_APPLICABLE
+                )
         # Prefer highlighting the matched context if available and non-empty
         n_ctx = details.get("n_context", 0)
         if match_line_num is not None and n_ctx > 0:
@@ -478,7 +496,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # After applying, re-evaluate so next hover highlights correctly
         self._evaluate_and_update_ui_for_hovered_chunk()
-
+        # Ensure left pane reflects 'already applied' state after apply
+        if self._hover_chunk_idx is not None and self._hover_chunk_idx >= 0:
+            self.patch_edit.set_chunk_status(
+                self._hover_chunk_idx, ChunkedPlainTextEdit.STATUS_ALREADY
+            )
     def _find_best_match(self, target_lines: list[str], query_lines: list[str], min_score=75) -> int | None:
         """Finds the best fuzzy match for a block of lines. Returns 1-based starting line number."""
         if not query_lines or not target_lines:
