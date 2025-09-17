@@ -167,17 +167,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Context menu "Apply Chunk" handler
         self.patch_edit.chunkApplyRequested.connect(self._on_chunk_apply_requested)
 
-        # Right: File viewer (in-memory single source of truth)
-        self.file_viewer = CodeEditor()
-        self.file_viewer.setReadOnly(False)
-        self.file_viewer.setPlaceholderText("Hover a chunk on the left; the file will load here if the view is empty.")
+        # Right: Tabbed file viewers (each tab is a CodeEditor)
+        self.right_tabs = QtWidgets.QTabWidget()
+        self.right_tabs.setTabsClosable(True)
+        self.right_tabs.tabCloseRequested.connect(self._close_tab_at)
         fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
-        self.file_viewer.setFont(fixed_font)
-        # For stable geometry
-        self.file_viewer.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
 
         splitter.addWidget(self.patch_edit)
-        splitter.addWidget(self.file_viewer)
+        splitter.addWidget(self.right_tabs)
         splitter.setSizes([700, 700])
 
         # Bottom dock: Root directory tree view (replaces diff preview)
@@ -213,22 +210,72 @@ class MainWindow(QtWidgets.QMainWindow):
         self._hover_already_applied: bool = False
         self._hover_apply_start_idx: int | None = None
         self._hover_highlight_len: int = 0
+        # Track a mapping of file path -> editor tab via tab data; debounced reevaluation on edits
+        # Debounce timer defined below
 
         # When user edits the right buffer, clear stale highlights and re-evaluate current hover state (debounced)
         self._debounce_timer = QtCore.QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(150)
         self._debounce_timer.timeout.connect(self._reevaluate_hover_state_once)
-        self.file_viewer.textChanged.connect(self._on_file_text_changed)
+        # Each editor created will connect its textChanged to _on_file_text_changed
 
         self.load_settings()
 
     def current_view_file(self) -> str | None:
-        v = self.file_viewer.property("current_file")
+        ed = self.current_editor()
+        if not ed:
+            return None
+        v = ed.property("current_file")
         return str(v) if v else None
 
     def is_view_empty(self) -> bool:
-        return (self.file_viewer.toPlainText() == "") and (self.current_view_file() is None)
+        return self.right_tabs.count() == 0
+
+    def current_editor(self) -> CodeEditor | None:
+        w = self.right_tabs.currentWidget()
+        return w if isinstance(w, CodeEditor) else None
+
+    def _editor_for_path(self, path: Path) -> CodeEditor | None:
+        target = str(path)
+        for i in range(self.right_tabs.count()):
+            w = self.right_tabs.widget(i)
+            if isinstance(w, CodeEditor):
+                p = w.property("current_file")
+                if p and str(p) == target:
+                    return w
+        return None
+
+    def _open_tab_for_file(self, full_path: Path, content: str | None) -> CodeEditor:
+        # If tab exists, select and return
+        existing = self._editor_for_path(full_path)
+        if existing:
+            self.right_tabs.setCurrentWidget(existing)
+            return existing
+        # Create new editor
+        ed = CodeEditor()
+        ed.setReadOnly(False)
+        ed.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        if content is not None:
+            ed.setPlainText(content)
+        ed.setProperty("current_file", str(full_path))
+        ed.textChanged.connect(self._on_file_text_changed)
+        title = full_path.name
+        idx = self.right_tabs.addTab(ed, title)
+        # Store full path in tab data for convenience
+        self.right_tabs.setTabToolTip(idx, str(full_path))
+        self.right_tabs.setCurrentIndex(idx)
+        return ed
+
+    @QtCore.Slot(int)
+    def _close_tab_at(self, index: int):
+        w = self.right_tabs.widget(index)
+        if w:
+            w.deleteLater()
+        self.right_tabs.removeTab(index)
+        # Clear diff preview when no editors remain
+        if self.right_tabs.count() == 0:
+            self._clear_diff_preview()
 
     @QtCore.Slot(bool)
     def _on_debug_toggled(self, on: bool):
@@ -243,7 +290,9 @@ class MainWindow(QtWidgets.QMainWindow):
     @QtCore.Slot()
     def _on_file_text_changed(self):
         # Clear transient highlight and re-evaluate applicability after a short debounce
-        self.file_viewer.clearExternalSelections()
+        sender = self.sender()
+        if isinstance(sender, CodeEditor):
+            sender.clearExternalSelections()
         self._debounce_timer.stop()
         self._debounce_timer.start()
 
@@ -253,13 +302,18 @@ class MainWindow(QtWidgets.QMainWindow):
             self.apply_btn.setEnabled(False)
             self._clear_diff_preview()
             return
+        ed = self.current_editor()
+        if ed is None:
+            self.apply_btn.setEnabled(False)
+            self._clear_diff_preview()
+            return
         # Re-run applicability based on current buffer
         self._evaluate_and_update_ui_for_hovered_chunk()
 
     @QtCore.Slot(int, str, list, QtGui.QTextBlock)
     def _on_chunk_hovered(self, chunk_idx: int, file_path: str, context_lines: list, _first_context_block: QtGui.QTextBlock):
         """
-        Loads file only if the right panel is empty; otherwise reuses current buffer.
+        Ensure a tab is open for the chunk's file (create/select), load file if needed.
         Computes applicability of hovered chunk against the current buffer and updates apply button and highlight.
         """
         # Clear when leaving a chunk
@@ -271,7 +325,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._hover_already_applied = False
             self._hover_apply_start_idx = None
             self._hover_highlight_len = 0
-            self.file_viewer.clearExternalSelections()
+            if self.current_editor():
+                self.current_editor().clearExternalSelections()
             self.apply_btn.setEnabled(False)
             self._clear_diff_preview()
             # Do not clear previously known statuses; they remain until content changes
@@ -305,36 +360,24 @@ class MainWindow(QtWidgets.QMainWindow):
         rel = Path(self._hover_chunk_file)
         full_path = (root / rel).resolve(strict=False)
 
-        # Load only if right panel is empty
-        current_path = self.current_view_file()
-        if self.is_view_empty():
-            # Try to load file if it exists; otherwise, keep an empty buffer but set current_file property
+        # Ensure a tab exists for this file and select it. Load content if first time.
+        ed = self._editor_for_path(full_path)
+        if ed is None:
             if full_path.is_file():
                 try:
                     with open(full_path, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                    self.file_viewer.setPlainText(content)
-                    self.file_viewer.setProperty("current_file", str(full_path))
+                    ed = self._open_tab_for_file(full_path, content)
                     self.statusBar().showMessage(f"Loaded: {rel.as_posix()}", 4000)
                 except Exception as e:
-                    self.file_viewer.setPlainText(f"Error reading file: {full_path}\n\n{str(e)}")
-                    self.file_viewer.setProperty("current_file", str(full_path))
+                    ed = self._open_tab_for_file(full_path, f"Error reading file: {full_path}\n\n{str(e)}")
                     self.statusBar().showMessage(f"Error reading {rel.as_posix()}", 4000)
             else:
-                # Start with empty buffer but remember target file path
-                self.file_viewer.setPlainText("")
-                self.file_viewer.setProperty("current_file", str(full_path))
+                ed = self._open_tab_for_file(full_path, "")
                 self.statusBar().showMessage(f"File not found; editing new buffer: {rel.as_posix()}", 4000)
         else:
-            # Reuse existing buffer; if it's a different file, do not switch
-            if current_path and Path(current_path) != full_path:
-                self.statusBar().showMessage(
-                    f"Right panel has {Path(current_path).name}; chunk is for {rel.as_posix()}. Not switching.", 5000
-                )
-                self.apply_btn.setEnabled(False)
-                self.file_viewer.clearExternalSelections()
-                self._clear_diff_preview()
-                return
+            # Select existing tab
+            self.right_tabs.setCurrentWidget(ed)
 
         # Evaluate applicability and update highlight/UI
         self._evaluate_and_update_ui_for_hovered_chunk()
@@ -354,14 +397,14 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Ensure file path matches the loaded buffer (we already constrained on hover, but double-check)
-        current_path = self.current_view_file()
+        current_path = ed.property("current_file")
         if not current_path or (details["file_path"].replace("\\", "/") not in str(current_path).replace("\\", "/")):
             self.apply_btn.setEnabled(False)
             self._clear_diff_preview()
             return
 
         # Compute match and applicability on current buffer
-        lines = self.file_viewer.toPlainText().splitlines()
+        lines = ed.toPlainText().splitlines()
         match_line_num = self._find_best_match(lines, details["context_lines"], min_score=60)
         applicable, already_applied, apply_start_idx, highlight_len = self._evaluate_chunk_applicability(
             lines, details, match_line_num
@@ -389,14 +432,14 @@ class MainWindow(QtWidgets.QMainWindow):
         # Prefer highlighting the matched context if available and non-empty
         n_ctx = details.get("n_context", 0)
         if match_line_num is not None and n_ctx > 0:
-            self._scroll_target_line_to_top(self.file_viewer, match_line_num)
+            self._scroll_target_line_to_top(ed, match_line_num)
             # Highlight context (blue) or applied region will be highlighted when applied
-            self._highlight_context_in_file_viewer(match_line_num, n_ctx)
+            self._highlight_context_in_file_viewer(match_line_num, n_ctx, target_editor=ed)
         # If there are no context lines in this chunk, fall back to previewing the edit region
         elif self._hover_apply_start_idx is not None and self._hover_highlight_len > 0:
             applied_start_line = self._hover_apply_start_idx + 1  # 1-based
-            self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
-            self._highlight_context_in_file_viewer(applied_start_line, self._hover_highlight_len)
+            self._scroll_target_line_to_top(ed, applied_start_line)
+            self._highlight_context_in_file_viewer(applied_start_line, self._hover_highlight_len, target_editor=ed)
         else:
             # Try a simple exact search on the first non-empty context line as a fallback
             first_ctx_line = next((l for l in details["context_lines"] if l.strip()), None)
@@ -404,11 +447,11 @@ class MainWindow(QtWidgets.QMainWindow):
                 try:
                     pos = lines.index(first_ctx_line)
                     self._scroll_target_line_to_top(self.file_viewer, pos + 1)
-                    self._highlight_context_in_file_viewer(pos + 1, 1)
+                    self._highlight_context_in_file_viewer(pos + 1, 1, target_editor=ed)
                 except ValueError:
-                    self.file_viewer.clearExternalSelections()
+                    ed.clearExternalSelections()
             else:
-                self.file_viewer.clearExternalSelections()
+                ed.clearExternalSelections()
 
         # Update Apply button state and diff preview
         if already_applied:
@@ -418,7 +461,7 @@ class MainWindow(QtWidgets.QMainWindow):
         elif applicable and apply_start_idx is not None:
             self.apply_btn.setEnabled(True)
             self.apply_btn.setToolTip("Apply this chunk to the current buffer.")
-            self._update_diff_preview(details, apply_start_idx)
+            self._update_diff_preview(details, apply_start_idx, ed)
         else:
             self.apply_btn.setEnabled(False)
             self.apply_btn.setToolTip("Context not found or ambiguous in current buffer.")
@@ -468,7 +511,10 @@ class MainWindow(QtWidgets.QMainWindow):
             return
 
         # Ensure applicability computed
-        lines = self.file_viewer.toPlainText().splitlines()
+        ed = self.current_editor()
+        if ed is None:
+            return
+        lines = ed.toPlainText().splitlines()
         if self._hover_apply_start_idx is None or not self._hover_applicable:
             match_line_num = self._find_best_match(lines, details["context_lines"], min_score=60)
             applicable, already, start_idx, hlen = self._evaluate_chunk_applicability(lines, details, match_line_num)
@@ -481,15 +527,16 @@ class MainWindow(QtWidgets.QMainWindow):
 
         # Apply to in-memory buffer only
         new_lines = self._apply_at(lines, self._hover_apply_start_idx, details["removed_lines"], details["added_lines"])
-        self.file_viewer.setPlainText("\n".join(new_lines))
-        self.file_viewer.document().setModified(True)
+        ed.setPlainText("\n".join(new_lines))
+        ed.document().setModified(True)
 
         applied_start_line = self._hover_apply_start_idx + 1  # 1-based
-        self._scroll_target_line_to_top(self.file_viewer, applied_start_line)
+        self._scroll_target_line_to_top(ed, applied_start_line)
         self._highlight_context_in_file_viewer(
             applied_start_line,
             max(1, len(details["added_lines"]) or len(details["removed_lines"])),
             color=QtGui.QColor(170, 255, 170, 140),
+            target_editor=ed,
         )
 
         self.statusBar().showMessage(f"Applied chunk (in-memory only) to: {Path(current_path).name}", 4000)
@@ -567,7 +614,7 @@ class MainWindow(QtWidgets.QMainWindow):
         highlight_len = max(1, len(added) if added else (len(removed) if removed else 1))
         return True, False, start_idx, highlight_len
 
-    def _update_diff_preview(self, details: dict, start_idx: int):
+    def _update_diff_preview(self, details: dict, start_idx: int, editor: QtWidgets.QPlainTextEdit):
         """No-op: diff preview replaced by root directory tree view."""
         return
 
@@ -603,9 +650,13 @@ class MainWindow(QtWidgets.QMainWindow):
             print(f"[ALIGN] Top-align: cursor_top={rect.top()} scrollbar: {before} -> {sb.value()}")
 
     def _highlight_context_in_file_viewer(self, start_line_num: int, num_lines: int,
-                                          color: QtGui.QColor = QtGui.QColor(128, 200, 255, 120)):
-        """Highlights num_lines lines starting at 1-based start_line_num in the file_viewer."""
-        doc = self.file_viewer.document()
+                                          color: QtGui.QColor = QtGui.QColor(128, 200, 255, 120),
+                                          target_editor: QtWidgets.QPlainTextEdit | None = None):
+        """Highlights num_lines lines starting at 1-based start_line_num in the given editor (current tab by default)."""
+        editor = target_editor or self.current_editor()
+        if editor is None:
+            return
+        doc = editor.document()
         start_idx = max(0, start_line_num - 1)
         end_idx = start_idx + max(0, num_lines - 1)
 
@@ -613,7 +664,7 @@ class MainWindow(QtWidgets.QMainWindow):
         end_block = doc.findBlockByNumber(end_idx)
 
         if not start_block.isValid() or not end_block.isValid():
-            self.file_viewer.clearExternalSelections()
+            editor.clearExternalSelections()
             if self._debug:
                 print("[HILITE] Invalid block range for highlighting.")
             return
@@ -632,7 +683,7 @@ class MainWindow(QtWidgets.QMainWindow):
         sel.cursor = cur
 
         # Apply without losing current-line highlight
-        self.file_viewer.setExternalSelections([sel])
+        editor.setExternalSelections([sel])
 
         if self._debug:
             print(f"[HILITE] Highlighting lines {start_idx + 1}..{end_idx + 1}")
