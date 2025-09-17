@@ -406,6 +406,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.apply_btn.setToolTip("Context not found or ambiguous in current buffer.")
             self._clear_diff_preview(show_message="Context not found or ambiguous.")
 
+        # Update hover tooltip with applicability status
+        if self._hover_chunk_idx is not None and self._hover_chunk_idx >= 0:
+            if already_applied:
+                status = "Already applied"
+            elif applicable:
+                status = "Applicable"
+            else:
+                status = "Not applicable"
+            QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"Chunk #{self._hover_chunk_idx + 1}  {status}", self.patch_edit)
+
     @QtCore.Slot(int)
     def _on_chunk_apply_requested(self, chunk_idx: int):
         """Apply from the left context menu; internally delegates to the same logic as the top button."""
