@@ -24,6 +24,11 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
     # Emitted when the user chooses "Apply" via context menu on a chunk
     chunkApplyRequested = QtCore.Signal(int)
 
+    # Status constants
+    STATUS_APPLICABLE = "applicable"
+    STATUS_ALREADY = "already_applied"
+    STATUS_NOT_APPLICABLE = "not_applicable"
+
     def __init__(self, parent=None, context_before=3, debug=False):
         super().__init__(parent)
         fixed_font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.FixedFont)
@@ -40,7 +45,20 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._chunk_context_info = []  # list[(context_lines, first_context_block)]
         self._last_hover_chunk = None
 
-        self._fmt_chunk_green = self._make_bg_format(QtGui.QColor(128, 255, 170, 140))
+        # Formats:
+        # - Hover highlight: yellow
+        self._fmt_hover_yellow = self._make_bg_format(QtGui.QColor(255, 255, 128, 160))
+        # - Base colors by applicability state (persist on the chunk)
+        self._fmt_state_applicable = self._make_bg_format(QtGui.QColor(128, 255, 170, 140))   # green
+        self._fmt_state_not_applicable = self._make_bg_format(QtGui.QColor(255, 128, 128, 140))  # red
+        self._fmt_state_already = self._make_bg_format(QtGui.QColor(200, 128, 255, 140))      # purple
+
+        # Per-chunk status and selections
+        self._chunk_status = {}         # idx -> status string
+        self._base_selections = []      # list[ExtraSelection] reflecting statuses (no hover)
+
+        # Apply any base selections by default
+        self.setExtraSelections(self._base_selections)
 
         self.document().contentsChanged.connect(self._recompute_chunks)
         self._recompute_chunks()
@@ -126,6 +144,9 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self._chunk_file_paths.clear()
         self._chunk_context_info.clear()
 
+        # Reset statuses and base selections on recompute
+        self._chunk_status.clear()
+        self._base_selections.clear()
         current_filepath = ""
         in_hunk = False
 
@@ -236,7 +257,8 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
         self.chunks_recomputed.emit(self._chunk_count)
 
     def _clear_highlight(self):
-        self.setExtraSelections([])
+        # Keep base selections (status colors), remove only hover overlay
+        self.setExtraSelections(list(self._base_selections))
 
     def _apply_chunk_highlight(self, chunk_idx: int):
         if chunk_idx < 0 or chunk_idx >= len(self._chunk_pos_spans):
@@ -244,11 +266,53 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
             return
         start_pos, end_pos_excl = self._chunk_pos_spans[chunk_idx]
         sel = QtWidgets.QTextEdit.ExtraSelection()
-        sel.format = self._fmt_chunk_green
+        # Hover uses yellow
+        sel.format = self._fmt_hover_yellow
         sel.cursor = self.textCursor()
         sel.cursor.setPosition(start_pos)
         sel.cursor.setPosition(end_pos_excl, QtGui.QTextCursor.KeepAnchor)
-        self.setExtraSelections([sel])
+        # Combine base (status) selections with hover overlay
+        combined = list(self._base_selections)
+        combined.append(sel)
+        self.setExtraSelections(combined)
+
+    def _rebuild_base_selections(self):
+        """Rebuild persistent base selections for all chunks based on their status."""
+        self._base_selections.clear()
+        for idx, (start_pos, end_pos_excl) in enumerate(self._chunk_pos_spans):
+            status = self._chunk_status.get(idx)
+            if not status:
+                continue
+            fmt = None
+            if status == self.STATUS_APPLICABLE:
+                fmt = self._fmt_state_applicable
+            elif status == self.STATUS_NOT_APPLICABLE:
+                fmt = self._fmt_state_not_applicable
+            elif status == self.STATUS_ALREADY:
+                fmt = self._fmt_state_already
+            if fmt is None:
+                continue
+            sel = QtWidgets.QTextEdit.ExtraSelection()
+            sel.format = fmt
+            sel.cursor = self.textCursor()
+            sel.cursor.setPosition(start_pos)
+            sel.cursor.setPosition(end_pos_excl, QtGui.QTextCursor.KeepAnchor)
+            self._base_selections.append(sel)
+
+    def set_chunk_status(self, chunk_idx: int, status: str | None):
+        """
+        Set or clear the applicability status for a chunk.
+        status in {STATUS_APPLICABLE, STATUS_ALREADY, STATUS_NOT_APPLICABLE} or None to clear.
+        """
+        if chunk_idx < 0 or chunk_idx >= len(self._chunk_pos_spans):
+            return
+        if status is None:
+            self._chunk_status.pop(chunk_idx, None)
+        else:
+            self._chunk_status[chunk_idx] = status
+        self._rebuild_base_selections()
+        # Apply base selections immediately (hover overlay, if any, will re-apply)
+        self.setExtraSelections(list(self._base_selections))
 
     def mouseMoveEvent(self, event: QtGui.QMouseEvent):
         cursor = self.cursorForPosition(event.pos())
@@ -290,9 +354,16 @@ class ChunkedPlainTextEdit(QtWidgets.QPlainTextEdit):
 
         menu = QtWidgets.QMenu(self)
         act_apply = menu.addAction(f"Apply Chunk #{idx + 1}")
+        act_copy = menu.addAction("Copy")
         chosen = menu.exec(event.globalPos())
         if chosen == act_apply:
             self.chunkApplyRequested.emit(idx)
+        elif chosen == act_copy:
+            details = self.get_chunk_details(idx)
+            if details:
+                # Copy only the '+' lines of the chunk, without the leading '+'
+                added_lines = details.get("added_lines", [])
+                QtWidgets.QApplication.clipboard().setText("\n".join(added_lines))
 
     def chunk_count(self) -> int:
         return self._chunk_count
